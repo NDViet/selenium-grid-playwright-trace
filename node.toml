@@ -1,0 +1,17 @@
+# Launch command — --ext must come BEFORE the subcommand:
+#
+#   java -jar selenium-server.jar \
+#     --ext build/libs/selenium-playwright-trace-1.0.0-SNAPSHOT.jar \
+#     node \
+#     --config node.toml
+
+[node]
+port = 5555
+max-sessions = 4
+session-timeout = 300
+
+[playwright-trace]
+enabled = true
+# output-dir = "/tmp/playwright-traces"   # default: {user.dir}/trace
+screenshots = true
+snapshots = true
