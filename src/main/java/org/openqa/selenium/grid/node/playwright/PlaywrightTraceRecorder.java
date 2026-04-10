@@ -41,27 +41,40 @@ import org.openqa.selenium.remote.http.HttpResponse;
  * <h2>How it works</h2>
  *
  * <ol>
- *   <li>When a session starts and advertises {@code se:cdp}, Playwright connects to the browser
- *       over CDP and begins recording a trace (screenshots + DOM snapshots).
- *   <li>Each WebDriver command opens a named trace group with a semantic action label (e.g. {@code
- *       "Navigate — https://example.com"}, {@code "Click"}, {@code "Type — 'hello'"}).
- *   <li>Each command opens a named trace group. For action-dispatch commands (navigation, element
- *       interactions, script execution, etc.) a lightweight {@code page.evaluate("1")} is fired
- *       <em>after</em> the command completes. Because {@code evaluate()} is a real Playwright
- *       action, the tracer captures a before/after DOM snapshot at that point — this is what
- *       populates the DOM preview panel in {@code trace.playwright.dev}. Read-only and metadata
- *       commands only get a group label; no snapshot is taken for them.
- *   <li>When the session ends the trace is saved as a single {@code trace.zip}; open it at {@code
- *       trace.playwright.dev}.
+ *   <li>The interceptor is always loaded by the ServiceLoader and stands by with zero overhead
+ *       until a session that should be traced is created.
+ *   <li>When a traced session starts and advertises {@code se:cdp}, Playwright connects to the
+ *       browser over CDP and begins recording (screenshots + DOM snapshots).
+ *   <li>Each meaningful WebDriver command opens a named trace group with a semantic action label
+ *       (e.g. {@code "Navigate — https://example.com"}, {@code "Click — #submit"}). A lightweight
+ *       {@code page.evaluate("1")} is fired after the command so Playwright captures before/after
+ *       DOM snapshots — this populates the DOM preview in {@code trace.playwright.dev}.
+ *   <li>When the session ends the trace is saved as {@code trace_<sessionId>.zip}.
  * </ol>
  *
- * <h2>Configuration</h2>
+ * <h2>Activation</h2>
+ *
+ * <p>Two levels of control:
+ *
+ * <ol>
+ *   <li><b>Global default</b> — environment variable {@code SE_RECORD_TRACE}:
+ *       <ul>
+ *         <li>{@code SE_RECORD_TRACE=true} → all Chromium sessions are traced by default.
+ *         <li>Not set or {@code false} → no sessions are traced by default.
+ *       </ul>
+ *   <li><b>Per-session override</b> — WebDriver capability {@code se:recordTrace}:
+ *       <ul>
+ *         <li>{@code "se:recordTrace": true} → trace this session regardless of the global default.
+ *         <li>{@code "se:recordTrace": false} → skip this session regardless of the global default.
+ *         <li>Absent → fall back to the global default.
+ *       </ul>
+ * </ol>
+ *
+ * <h2>Configuration (node.toml)</h2>
  *
  * <pre>{@code
- * # node.toml
  * [playwright-trace]
- * enabled = true
- * output-dir = /tmp/playwright-traces   # default: {user.dir}/trace
+ * output-dir = /tmp/playwright-traces   # default: {user.dir}/traces
  * screenshots = true                    # screenshots in trace (default: true)
  * snapshots = true                      # DOM snapshots in trace (default: true)
  * }</pre>
@@ -69,11 +82,13 @@ import org.openqa.selenium.remote.http.HttpResponse;
  * <h2>Resource strategy</h2>
  *
  * <ul>
- *   <li><b>Thread safety:</b> a single dedicated thread owns the {@link Playwright} instance
- *       (Playwright requires thread affinity). All Playwright calls are posted to it.
- *   <li><b>Zero latency:</b> group open/close are fire-and-forget; no blocking is added to the
- *       WebDriver command path. The only intentional block is on DELETE /session, where the trace
- *       must be flushed before the CDP connection closes.
+ *   <li><b>Thread safety:</b> a single dedicated thread owns the {@link Playwright} instance. All
+ *       Playwright calls are posted to it; Playwright's thread-affinity requirement is met.
+ *   <li><b>Lazy init:</b> Playwright is initialised on the first session that needs tracing, not at
+ *       node startup. Nodes where no session requests tracing pay zero CDP overhead.
+ *   <li><b>Zero latency:</b> group open/close and DOM snapshots are fire-and-forget. The only
+ *       intentional block is on DELETE /session, where the trace must be flushed before the CDP
+ *       connection closes.
  * </ul>
  *
  * <h2>Usage</h2>
@@ -82,11 +97,10 @@ import org.openqa.selenium.remote.http.HttpResponse;
  * # build the fat JAR
  * ./gradlew shadowJar
  *
- * # launch the node
- * java -jar selenium-server.jar \
+ * # launch the node (SE_RECORD_TRACE enables tracing globally)
+ * SE_RECORD_TRACE=true java -jar selenium-server.jar \
  *   --ext build/libs/selenium-playwright-trace-1.0.0-SNAPSHOT.jar \
- *   node \
- *   --config node.toml
+ *   node --config node.toml
  * }</pre>
  */
 public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
@@ -117,10 +131,15 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   private static final Pattern PAT_COOKIE = Pattern.compile("/cookie/[^/]+");
 
   static final String SECTION = "playwright-trace";
-  private static final String OPT_ENABLED = "enabled";
   private static final String OPT_OUTPUT_DIR = "output-dir";
   private static final String OPT_SCREENSHOTS = "screenshots";
   private static final String OPT_SNAPSHOTS = "snapshots";
+
+  /** Environment variable that sets the global trace-recording default. */
+  static final String ENV_RECORD_TRACE = "SE_RECORD_TRACE";
+
+  /** WebDriver capability that overrides the global default per session. */
+  static final String CAP_RECORD_TRACE = "se:recordTrace";
 
   // All Playwright operations must run on this single thread (thread-affinity requirement).
   private final ExecutorService playwrightThread =
@@ -135,25 +154,34 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       new ConcurrentHashMap<>();
 
   private final AtomicBoolean closed = new AtomicBoolean(false);
+  private final AtomicBoolean playwrightInitialized = new AtomicBoolean(false);
 
   private volatile Playwright playwright;
 
   // Populated in initialize().
+  private volatile boolean globalEnabled;
   private Path outputDir;
   private boolean screenshots;
   private boolean snapshots;
 
   // ---- SPI ------------------------------------------------------------------
 
+  /**
+   * Always returns {@code true} — the interceptor is always wired into the node command chain and
+   * stands by with negligible overhead. Actual tracing is activated at runtime by the {@code
+   * SE_RECORD_TRACE} environment variable and/or the {@code se:recordTrace} capability.
+   */
   @Override
   public boolean isEnabled(Config config) {
-    return config.getBool(SECTION, OPT_ENABLED).orElse(false);
+    return true;
   }
 
   @Override
   public void initialize(Config config, EventBus bus) {
+    globalEnabled = "true".equalsIgnoreCase(System.getenv(ENV_RECORD_TRACE));
+
     String rawOutputDir =
-        config.get(SECTION, OPT_OUTPUT_DIR).orElse(System.getProperty("user.dir") + "/trace");
+        config.get(SECTION, OPT_OUTPUT_DIR).orElse(System.getProperty("user.dir") + "/traces");
     outputDir = Paths.get(rawOutputDir);
     screenshots = config.getBool(SECTION, OPT_SCREENSHOTS).orElse(true);
     snapshots = config.getBool(SECTION, OPT_SNAPSHOTS).orElse(true);
@@ -166,16 +194,14 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
     LOG.info(
         String.format(
-            "Playwright trace recorder enabled — output: %s, screenshots: %s, snapshots: %s",
-            outputDir, screenshots, snapshots));
+            "Playwright trace recorder standing by — SE_RECORD_TRACE=%s, output: %s,"
+                + " screenshots: %s, snapshots: %s",
+            globalEnabled, outputDir, screenshots, snapshots));
 
     bus.addListener(SessionCreatedEvent.listener(this::onSessionCreated));
 
-    playwrightThread.submit(this::initPlaywright);
-
-    // Fallback for JVM exit without an explicit LocalNode shutdown (e.g. SIGKILL recovery,
-    // standalone use without the SPI wiring). When LocalNode is used, close() is called first
-    // and the shutdown hook becomes a no-op due to the closed guard.
+    // Playwright is initialised lazily on the first session that needs tracing.
+    // Fallback shutdown hook: a no-op when LocalNode already called close().
     Runtime.getRuntime()
         .addShutdownHook(
             new Thread(
@@ -278,6 +304,30 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   // ---- Session lifecycle (called from EventBus listener threads) -----------
 
   private void onSessionCreated(SessionCreatedData data) {
+    // Resolve whether this session should be traced.
+    // Priority: per-session cap > global SE_RECORD_TRACE env var.
+    Object cap = data.getCapabilities().getCapability(CAP_RECORD_TRACE);
+    boolean trace;
+    if (cap instanceof Boolean) {
+      trace = (Boolean) cap;
+    } else if (cap != null) {
+      trace = Boolean.parseBoolean(cap.toString());
+    } else {
+      trace = globalEnabled;
+    }
+
+    if (!trace) {
+      LOG.fine(
+          "Trace recording disabled for session "
+              + data.getSessionId()
+              + " (SE_RECORD_TRACE="
+              + globalEnabled
+              + ", se:recordTrace="
+              + cap
+              + ")");
+      return;
+    }
+
     Object cdpCap = data.getCapabilities().getCapability("se:cdp");
     if (cdpCap == null) {
       LOG.info("No se:cdp capability for session " + data.getSessionId() + "; skipping trace");
@@ -307,6 +357,16 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
   // ---- Playwright operations (must run on playwrightThread) ----------------
 
+  /**
+   * Initialises the Playwright runtime on the first call; subsequent calls are no-ops. Must run on
+   * {@code playwrightThread}.
+   */
+  private void ensurePlaywrightInitialized() {
+    if (playwrightInitialized.compareAndSet(false, true)) {
+      initPlaywright();
+    }
+  }
+
   private void initPlaywright() {
     try {
       // We only use connectOverCDP — Playwright never needs to launch its own browsers.
@@ -323,6 +383,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
   private void connectAndStartTrace(
       SessionId sessionId, String cdpWsUrl, Path sessionTraceDir, SessionCreatedData data) {
+    ensurePlaywrightInitialized();
     if (playwright == null) {
       LOG.warning("Playwright not initialised; skipping trace for session " + sessionId);
       return;

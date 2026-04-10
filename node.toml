@@ -1,9 +1,13 @@
 # Launch command — --ext must come BEFORE the subcommand:
 #
-#   java -jar selenium-server.jar \
+#   SE_RECORD_TRACE=true java -jar selenium-server.jar \
 #     --ext build/libs/selenium-playwright-trace-1.0.0-SNAPSHOT.jar \
 #     node \
 #     --config node.toml
+#
+# Activation:
+#   SE_RECORD_TRACE=true   env var  — global default (trace all Chromium sessions)
+#   se:recordTrace=true/false cap   — per-session override (takes priority over global)
 
 [node]
 port = 5555
@@ -11,7 +15,6 @@ max-sessions = 4
 session-timeout = 300
 
 [playwright-trace]
-enabled = true
-# output-dir = "/tmp/playwright-traces"   # default: {user.dir}/trace
+# output-dir = "/tmp/playwright-traces"   # default: {user.dir}/traces
 screenshots = true
 snapshots = true

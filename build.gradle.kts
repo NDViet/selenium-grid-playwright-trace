@@ -1,20 +1,26 @@
-import java.net.URL
-
 plugins {
     java
+    `maven-publish`
+    signing
     id("com.github.johnrengelman.shadow") version "8.1.1"
     id("com.diffplug.spotless") version "7.0.2"
+    id("io.github.gradle-nexus.publish-plugin") version "2.0.0"
 }
 
 group = "org.ndviet"
-version = "1.0.0-SNAPSHOT"
+version = "4.43.0-SNAPSHOT"
 
 java {
     toolchain { languageVersion = JavaLanguageVersion.of(17) }
 }
 
+val seleniumVersion = findProperty("seleniumVersion") as String? ?: "+"
+
 repositories {
     mavenCentral()
+    if (seleniumVersion.endsWith("-SNAPSHOT")) {
+        maven("https://central.sonatype.com/repository/maven-snapshots/")
+    }
 }
 
 spotless {
@@ -26,51 +32,20 @@ spotless {
     }
 }
 
-// Resolves the selenium-server JAR from GitHub releases.
-// - Default: latest stable release (selenium-server-*.jar)
-// - Nightly:  ./gradlew -Pnightly=true  → selenium-server-*-SNAPSHOT.jar
-// - Override: ./gradlew -PseleniumServerJar=/absolute/path/to/selenium-server.jar
-fun fetchSeleniumServerJarUrl(isNightly: Boolean): String {
-    val apiEndpoint = if (isNightly)
-        "https://api.github.com/repos/SeleniumHQ/selenium/releases/tags/nightly"
-    else
-        "https://api.github.com/repos/SeleniumHQ/selenium/releases/latest"
-    val json = URL(apiEndpoint).readText()
-    val pattern = if (isNightly)
-        Regex(""""browser_download_url":\s*"(https://[^"]+/selenium-server-[^"]*-SNAPSHOT\.jar)"""")
-    else
-        Regex(""""browser_download_url":\s*"(https://[^"]+/selenium-server-\d[^"]*\.jar)"""")
-    return pattern.find(json)?.groupValues?.get(1)
-        ?: error("Could not find selenium-server JAR in GitHub release (nightly=$isNightly)")
-}
-
-val seleniumServerJar: String by lazy {
-    val prop = findProperty("seleniumServerJar") as String?
-    if (prop != null) return@lazy prop
-
-    val isNightly = (findProperty("nightly") as String?)?.toBoolean() ?: false
-    val jarUrl = fetchSeleniumServerJarUrl(isNightly)
-    val jarName = jarUrl.substringAfterLast("/")
-    val cacheDir = file("${rootProject.projectDir}/.gradle/selenium-server").also { it.mkdirs() }
-    val dest = File(cacheDir, jarName)
-    if (!dest.exists()) {
-        println("Downloading $jarName ...")
-        URL(jarUrl).openStream().use { input -> dest.outputStream().use { input.copyTo(it) } }
-        println("Saved to ${dest.absolutePath}")
-    }
-    dest.absolutePath
-}
-
 dependencies {
-    // Selenium Grid provides NodeCommandInterceptor, EventBus, Config, etc. at runtime.
-    // Use 'compileOnly' so we don't bundle it — it's already on the classpath when --ext loads us.
-    compileOnly(files(seleniumServerJar))
+    // Selenium Grid + remote-driver provide NodeCommandInterceptor, EventBus, Config, SessionId,
+    // HttpRequest/Response, etc. at runtime. Use 'compileOnly' so we don't bundle them — they're
+    // already on the classpath when --ext loads us. Available on Maven Central from 4.42.0;
+    // use -PseleniumVersion=x.y.z-SNAPSHOT for nightly.
+    compileOnly("org.seleniumhq.selenium:selenium-grid:$seleniumVersion")
+    compileOnly("org.seleniumhq.selenium:selenium-remote-driver:$seleniumVersion")
 
     // Playwright is bundled into our fat JAR (not on the server classpath).
     implementation("com.microsoft.playwright:playwright:+")
 
-    // Testing — same server JAR on test classpath
-    testImplementation(files(seleniumServerJar))
+    // Testing
+    testImplementation("org.seleniumhq.selenium:selenium-grid:$seleniumVersion")
+    testImplementation("org.seleniumhq.selenium:selenium-remote-driver:$seleniumVersion")
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.11.4")
     testImplementation("org.assertj:assertj-core:3.27.3")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
@@ -81,6 +56,25 @@ tasks.test {
 }
 
 val playwrightPlatforms = listOf("linux", "linux-arm64", "mac", "mac-arm64", "win32_x64")
+
+// Sources and Javadoc JARs — required by Maven Central.
+val sourcesJar by tasks.registering(Jar::class) {
+    archiveClassifier = "sources"
+    from(sourceSets.main.get().allSource)
+}
+val javadocJar by tasks.registering(Jar::class) {
+    archiveClassifier = "javadoc"
+    from(tasks.javadoc)
+}
+
+// Universal shadow JAR (all platforms bundled).
+tasks.shadowJar {
+    archiveClassifier = ""
+    dependencies {
+        exclude { it.moduleGroup.startsWith("org.seleniumhq") }
+    }
+    mergeServiceFiles()
+}
 
 // Register a shadowJar task per platform, each bundling only that platform's driver.
 // Output: build/libs/selenium-grid-playwright-trace-<version>-<platform>.jar
@@ -99,8 +93,68 @@ val platformJarTasks = playwrightPlatforms.map { platform ->
     }
 }
 
-// Disable the default shadowJar to avoid building the 200 MB all-platforms JAR.
-tasks.shadowJar { enabled = false }
+// Make 'build' produce universal + all platform JARs.
+tasks.build { dependsOn(tasks.shadowJar, platformJarTasks) }
 
-// Make 'build' produce all platform JARs.
-tasks.build { dependsOn(platformJarTasks) }
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            artifactId = "selenium-grid-playwright-trace"
+
+            // Universal JAR as the primary artifact.
+            artifact(tasks.shadowJar)
+            artifact(sourcesJar)
+            artifact(javadocJar)
+
+            // Per-platform JARs as classified artifacts.
+            playwrightPlatforms.forEach { platform ->
+                artifact(tasks.named("shadowJar-$platform"))
+            }
+
+            pom {
+                name = "selenium-grid-playwright-trace"
+                description = "Playwright trace recorder extension for Selenium Grid nodes"
+                url = "https://github.com/ndviet/selenium-grid-playwright-trace"
+                licenses {
+                    license {
+                        name = "The Apache License, Version 2.0"
+                        url = "https://www.apache.org/licenses/LICENSE-2.0.txt"
+                    }
+                }
+                developers {
+                    developer {
+                        id = "ndviet"
+                        name = "Viet Nguyen Duc"
+                        email = "nguyenducviet4496@gmail.com"
+                    }
+                }
+                scm {
+                    connection = "scm:git:git://github.com/ndviet/selenium-grid-playwright-trace.git"
+                    developerConnection = "scm:git:ssh://github.com/ndviet/selenium-grid-playwright-trace.git"
+                    url = "https://github.com/ndviet/selenium-grid-playwright-trace"
+                }
+            }
+        }
+    }
+}
+
+signing {
+    val gpgKey = System.getenv("GPG_PRIVATE_KEY") ?: findProperty("signing.key") as String?
+    val gpgPassphrase = System.getenv("GPG_PASSPHRASE") ?: findProperty("signing.password") as String?
+    if (gpgKey != null) useInMemoryPgpKeys(gpgKey, gpgPassphrase)
+    else useGpgCmd() // local gpg agent — uses signing.keyId / signing.password from gradle.properties
+    sign(publishing.publications["mavenJava"])
+}
+
+nexusPublishing {
+    repositories {
+        sonatype {
+            nexusUrl = uri("https://ossrh-staging-api.central.sonatype.com/service/local/")
+            snapshotRepositoryUrl = uri("https://central.sonatype.com/repository/maven-snapshots/")
+            username = System.getenv("MAVEN_CENTRAL_USERNAME")
+                ?: findProperty("ossrhUsername") as String?
+            password = System.getenv("MAVEN_CENTRAL_PASSWORD")
+                ?: findProperty("ossrhPassword") as String?
+        }
+    }
+}
