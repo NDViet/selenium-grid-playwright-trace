@@ -4,6 +4,45 @@ A [Selenium Grid Node](https://www.selenium.dev/documentation/grid/) extension t
 
 Traces are viewable at **[trace.playwright.dev](https://trace.playwright.dev)** and include screenshots, DOM snapshots, and semantic action labels per WebDriver command (e.g. `Navigate — https://example.com`, `Click — #submit`).
 
+## Quick Start
+
+**1. Fetch the extension JAR via Coursier**
+
+```bash
+cs fetch --cache . \
+  "org.ndviet:selenium-grid-playwright-trace:4.43.0" \
+  --artifact-type jar
+```
+
+This downloads `selenium-grid-playwright-trace-4.43.0.jar` (universal, all platforms) into the current directory.
+
+**2. Create `node.toml`**
+
+```toml
+[node]
+port = 4444
+max-sessions = 4
+session-timeout = 300
+
+[playwright-trace]
+# output-dir = "/tmp/playwright-traces"   # default: {user.dir}/traces
+screenshots = true
+snapshots = true
+```
+
+**3. Start Selenium Grid in standalone mode**
+
+```bash
+SE_RECORD_TRACE=true java -jar selenium-server.jar \
+  --ext selenium-grid-playwright-trace-4.43.0.jar \
+  standalone \
+  --config node.toml
+```
+
+Grid is now available at `http://localhost:4444`. Every Chromium session produces a `trace_<sessionId>.zip` in your configured `output-dir`.
+
+---
+
 ## Maven Central
 
 ```xml
