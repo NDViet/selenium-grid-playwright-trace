@@ -14,8 +14,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -25,6 +27,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
+import java.util.zip.ZipOutputStream;
 import org.openqa.selenium.events.EventBus;
 import org.openqa.selenium.grid.config.Config;
 import org.openqa.selenium.grid.data.SessionCreatedData;
@@ -153,13 +158,6 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   private final ConcurrentHashMap<SessionId, SessionTraceContext> sessions =
       new ConcurrentHashMap<>();
 
-  // Holds a short-lived Browser connection opened at the start of a WebDriver command for
-  // trace annotation (group open). The matching close task (groupEnd + disconnect) removes it.
-  // Both tasks are submitted to the single-threaded playwrightThread so they always execute
-  // in the correct open-then-close order without explicit coordination.
-  private final ConcurrentHashMap<SessionId, Browser> activeCommandBrowsers =
-      new ConcurrentHashMap<>();
-
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final AtomicBoolean playwrightInitialized = new AtomicBoolean(false);
 
@@ -237,6 +235,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       LOG.info("Node shutting down; saving " + remaining.size() + " active trace(s)");
       for (SessionId sessionId : remaining) {
         playwrightThread.submit(() -> stopAndSaveTrace(sessionId));
+        playwrightThread.submit(() -> disconnectBrowser(sessionId));
       }
     }
     playwrightThread.submit(this::closePlaywright);
@@ -266,19 +265,19 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     // session teardown (next.call()) always proceeds.
     if (isDeleteSession(req, id)) {
       try {
-        // FIFO ordering guarantees any pending annotation tasks complete before this runs.
-        // stopAndSaveTrace connects to CDP, flushes the trace, then disconnects — all within
-        // the submitted task, so there is no lingering WebSocket after it completes.
+        // FIFO ordering guarantees pending group/snapshot tasks complete before this runs.
         playwrightThread.submit(() -> stopAndSaveTrace(id)).get(15, TimeUnit.SECONDS);
       } catch (Exception e) {
         LOG.log(Level.WARNING, "Trace save before session delete failed for " + id, e);
       }
-      return next.call();
+      HttpResponse response = next.call();
+      // Disconnect after next.call() — the session is now gone so the browser.close() here
+      // only severs Playwright's direct Chrome CDP connection without touching any Selenium proxy.
+      playwrightThread.submit(() -> disconnectBrowser(id));
+      return response;
     }
 
-    // All other commands: annotate the trace best-effort via a short-lived CDP connection.
-    // connect-open-group and groupEnd-disconnect are submitted as two consecutive tasks on the
-    // single-threaded playwrightThread, so they always run in order without explicit locking.
+    // All other commands: annotate the trace best-effort using the persistent Playwright context.
     boolean groupOpen = false;
     try {
       if (isFindElement(req)) {
@@ -287,7 +286,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         if (selector != null) ctx.setLastSelector(selector);
       } else if (shouldTrace(req) && !isSeleniumAtomScript(req)) {
         String label = buildLabel(req, ctx);
-        playwrightThread.submit(() -> connectAndOpenGroup(id, ctx, label));
+        playwrightThread.submit(() -> safeGroup(ctx, label));
         groupOpen = true;
       }
     } catch (Exception e) {
@@ -296,10 +295,20 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
     HttpResponse response = next.call(); // Always reached.
 
-    // Fire-and-forget: DOM snapshot + group close + disconnect.
+    // Fire-and-forget: DOM snapshot + group close + flush chunk to disk.
     if (groupOpen) {
       try {
-        playwrightThread.submit(() -> snapshotCloseAndDisconnect(id));
+        playwrightThread.submit(
+            () -> {
+              if (snapshots) safeDomSnapshot(ctx);
+              safeGroupClose(ctx);
+              // Persist this command's trace events to disk immediately.
+              // Each stopChunk() + startChunk() pair atomically flushes the current chunk
+              // and opens the next one — Chrome's tracing continues uninterrupted.
+              // This means the trace is always up-to-date on disk: if the JVM crashes or the
+              // session is abandoned, all completed commands are already saved as chunk files.
+              safeFlushChunk(id, ctx);
+            });
       } catch (Exception e) {
         LOG.log(Level.FINE, "Trace post-command failed for session " + id, e);
       }
@@ -334,23 +343,21 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       return;
     }
 
+    SessionId sessionId = data.getSessionId();
+
     Object cdpCap = data.getCapabilities().getCapability("se:cdp");
     if (cdpCap == null) {
-      LOG.info("No se:cdp capability for session " + data.getSessionId() + "; skipping trace");
+      LOG.info("No se:cdp capability for session " + sessionId + "; skipping trace");
       return;
     }
 
-    SessionId sessionId = data.getSessionId();
     // Build a direct Node WebSocket URL for CDP, bypassing any Grid hub/router.
     // The se:cdp capability routes through the hub (e.g. ws://hub:4444/...) which hangs
     // Playwright's connectOverCDP handshake. We connect straight to the Node instead.
     URI nodeUri = data.getNodeUri();
     String wsScheme = "https".equals(nodeUri.getScheme()) ? "wss" : "ws";
     int port = nodeUri.getPort();
-    if (port == -1) {
-      port = "https".equals(nodeUri.getScheme()) ? 443 : 80;
-    }
-    // Preserve any sub-path prefix the node may have been configured with.
+    if (port == -1) port = "https".equals(nodeUri.getScheme()) ? 443 : 80;
     String subPath = nodeUri.getRawPath() == null ? "" : nodeUri.getRawPath().replaceAll("/$", "");
     String cdpWsUrl =
         String.format(
@@ -388,30 +395,30 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   }
 
   private void connectAndStartTrace(
-      SessionId sessionId, String cdpWsUrl, Path sessionTraceDir, SessionCreatedData data) {
+      SessionId sessionId, String cdpUrl, Path sessionTraceDir, SessionCreatedData data) {
     ensurePlaywrightInitialized();
     if (playwright == null) {
       LOG.warning("Playwright not initialised; skipping trace for session " + sessionId);
       return;
     }
-    Browser browser = null;
     try {
-      browser =
+      Browser browser =
           playwright
               .chromium()
               .connectOverCDP(
-                  cdpWsUrl,
+                  cdpUrl,
                   new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
                       .setTimeout(10_000));
 
       List<BrowserContext> contexts = browser.contexts();
       if (contexts.isEmpty()) {
         LOG.warning("No browser contexts for session " + sessionId + "; skipping trace");
+        browser.close();
         return;
       }
 
-      contexts
-          .get(0)
+      BrowserContext context = contexts.get(0);
+      context
           .tracing()
           .start(
               new Tracing.StartOptions()
@@ -419,136 +426,207 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
                   .setSnapshots(snapshots)
                   .setSources(false));
 
-      // Register the session before disconnecting so intercept() can find it.
+      // Enter chunk mode immediately so every command's events can be flushed to disk via
+      // stopChunk() + startChunk() without stopping the overall trace.
+      context.tracing().startChunk();
+
       sessions.put(
-          sessionId, new SessionTraceContext(cdpWsUrl, sessionTraceDir, sessionId.toString()));
+          sessionId,
+          new SessionTraceContext(browser, context, sessionTraceDir, sessionId.toString()));
 
       LOG.info(
           String.format(
-              "Playwright trace started for session %s (%s) — CDP connection released",
+              "Playwright trace started for session %s (%s)",
               sessionId, data.getCapabilities().getBrowserName()));
     } catch (Exception e) {
       LOG.log(
           Level.WARNING,
-          "Failed to connect Playwright for session " + sessionId + " at " + cdpWsUrl,
+          "Failed to connect Playwright for session " + sessionId + " at " + cdpUrl,
           e);
-    } finally {
-      // Disconnect immediately. Chrome continues tracing internally; we reconnect on-demand
-      // per WebDriver command and again at session end to stop and save the trace.
-      // This ensures no persistent CDP WebSocket is held, allowing the Node's session-timeout
-      // to fire normally when a client disconnects without deleting the session.
-      if (browser != null) {
-        try {
-          browser.close();
-        } catch (Exception ignored) {
-        }
-      }
     }
   }
 
-  /**
-   * Reconnects to the browser via CDP, stops Chrome's tracing, saves the trace zip, then
-   * disconnects. Must run on {@code playwrightThread}.
-   *
-   * <p>Chrome's {@code Tracing.start} is a global browser-level operation that persists across CDP
-   * WebSocket connections. Calling {@code tracing().stop()} on a fresh {@link BrowserContext}
-   * obtained via a new {@code connectOverCDP()} sends {@code Tracing.end()} to Chrome, which
-   * responds with all buffered {@code Tracing.dataCollected} events regardless of which CDP client
-   * originally started the trace.
-   */
   private void stopAndSaveTrace(SessionId sessionId) {
     SessionTraceContext ctx = sessions.remove(sessionId);
     if (ctx == null) {
       LOG.info("No active trace for session " + sessionId + " — nothing to save");
       return;
     }
-    Path tracePath = ctx.traceDir().resolve("trace_" + sessionId + ".zip");
-    Browser browser = null;
+    // Stop the current chunk and save it. This is the last chunk — it covers any commands
+    // that ran after the most recent safeFlushChunk() call (e.g. un-traced GET commands).
+    Path lastChunk = ctx.nextChunkPath();
     try {
-      browser =
-          playwright
-              .chromium()
-              .connectOverCDP(
-                  ctx.cdpWsUrl(),
-                  new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
-                      .setTimeout(10_000));
-      List<BrowserContext> contexts = browser.contexts();
-      if (contexts.isEmpty()) {
-        LOG.warning("No browser contexts on stop for session " + sessionId);
-        return;
-      }
-      contexts.get(0).tracing().stop(new Tracing.StopOptions().setPath(tracePath));
+      ctx.context().tracing().stopChunk(new Tracing.StopChunkOptions().setPath(lastChunk));
+      ctx.addChunk(lastChunk);
+    } catch (Exception e) {
+      LOG.log(Level.WARNING, "Error stopping final trace chunk for session " + sessionId, e);
+    }
+
+    Path tracePath = ctx.traceDir().resolve("trace_" + sessionId + ".zip");
+    try {
+      mergeChunks(ctx.chunks(), tracePath);
       LOG.info("Playwright trace saved for session " + sessionId + ": " + tracePath);
     } catch (Exception e) {
-      LOG.log(Level.WARNING, "Error stopping/saving trace for session " + sessionId, e);
+      LOG.log(Level.WARNING, "Error merging trace chunks for session " + sessionId, e);
     } finally {
-      if (browser != null) {
+      for (Path chunk : ctx.chunks()) {
         try {
-          browser.close();
+          Files.deleteIfExists(chunk);
         } catch (Exception ignored) {
         }
       }
     }
   }
 
-  /**
-   * Opens a short-lived CDP connection, opens a trace group for the given label, and stores the
-   * {@link Browser} handle in {@code activeCommandBrowsers} for the matching close task. Must run
-   * on {@code playwrightThread}.
-   */
-  private void connectAndOpenGroup(SessionId sessionId, SessionTraceContext ctx, String label) {
+  private void disconnectBrowser(SessionId sessionId) {
+    SessionTraceContext ctx = sessions.get(sessionId);
+    if (ctx == null) return;
     try {
-      Browser browser =
-          playwright
-              .chromium()
-              .connectOverCDP(
-                  ctx.cdpWsUrl(),
-                  new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
-                      .setTimeout(5_000));
-      List<BrowserContext> contexts = browser.contexts();
-      if (contexts.isEmpty()) {
-        browser.close();
-        return;
-      }
-      contexts.get(0).tracing().group(label);
-      activeCommandBrowsers.put(sessionId, browser);
+      ctx.browser().close();
+      LOG.fine("Playwright CDP connection released for session " + sessionId);
     } catch (Exception e) {
-      LOG.log(Level.FINE, "CDP connect/group open failed for session " + sessionId, e);
+      LOG.log(Level.FINE, "Error disconnecting browser for session " + sessionId, e);
     }
   }
 
   /**
-   * Fires a DOM snapshot, closes the trace group, then disconnects the short-lived connection
-   * opened by {@link #connectAndOpenGroup}. Must run on {@code playwrightThread}.
+   * Flushes the current trace chunk to disk and opens the next one. Must run on {@code
+   * playwrightThread}. Called after every traced command so the trace is always durable: all
+   * completed commands are persisted as chunk files regardless of how the session ends.
    */
-  private void snapshotCloseAndDisconnect(SessionId sessionId) {
-    Browser browser = activeCommandBrowsers.remove(sessionId);
-    if (browser == null) return;
+  private void safeFlushChunk(SessionId sessionId, SessionTraceContext ctx) {
     try {
-      List<BrowserContext> contexts = browser.contexts();
-      if (!contexts.isEmpty()) {
-        BrowserContext context = contexts.get(0);
-        if (snapshots) {
-          List<Page> pages = context.pages();
-          if (!pages.isEmpty()) {
-            try {
-              pages.get(0).evaluate("1");
-            } catch (Exception e) {
-              LOG.log(Level.FINE, "DOM snapshot failed for session " + sessionId, e);
+      Path chunkPath = ctx.nextChunkPath();
+      ctx.context().tracing().stopChunk(new Tracing.StopChunkOptions().setPath(chunkPath));
+      ctx.addChunk(chunkPath);
+      ctx.context().tracing().startChunk();
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "Chunk flush failed for session " + sessionId, e);
+    }
+  }
+
+  /**
+   * Merges one or more Playwright trace chunk zip files into a single trace zip.
+   *
+   * <p>Playwright's trace zip layout:
+   *
+   * <pre>
+   * trace.zip
+   * ├── trace.json   — NDJSON; each line is a trace event
+   * ├── network.json — NDJSON; each line is a network event
+   * └── resources/   — content-addressed binary files (screenshots, DOM snapshots)
+   * </pre>
+   *
+   * <p>Merging strategy:
+   *
+   * <ul>
+   *   <li>{@code trace.json} / {@code network.json} — lines from all chunks are concatenated in
+   *       order. The {@code context-options} preamble event that Playwright emits at the start of
+   *       each chunk is deduplicated (only the first occurrence is kept).
+   *   <li>{@code resources/*} — content-addressed so identical names mean identical bytes; the
+   *       first occurrence wins and duplicates are skipped.
+   * </ul>
+   */
+  private static void mergeChunks(List<Path> chunks, Path output) throws IOException {
+    List<byte[]> traceLines = new ArrayList<>();
+    List<byte[]> networkLines = new ArrayList<>();
+    Set<String> resourcesSeen = new HashSet<>();
+    boolean contextOptionsSeen = false;
+
+    // Pass 1: collect lines and resource names.
+    for (Path chunk : chunks) {
+      if (!Files.exists(chunk)) continue;
+      try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(chunk))) {
+        ZipEntry entry;
+        while ((entry = zin.getNextEntry()) != null) {
+          String name = entry.getName();
+          byte[] data = zin.readAllBytes();
+          if ("trace.json".equals(name)) {
+            for (String line : new String(data, StandardCharsets.UTF_8).split("\n")) {
+              if (line.isBlank()) continue;
+              // Keep only the first context-options preamble across all chunks.
+              if (line.contains("\"context-options\"")) {
+                if (contextOptionsSeen) continue;
+                contextOptionsSeen = true;
+              }
+              traceLines.add((line + "\n").getBytes(StandardCharsets.UTF_8));
             }
+          } else if ("network.json".equals(name)) {
+            for (String line : new String(data, StandardCharsets.UTF_8).split("\n")) {
+              if (!line.isBlank()) networkLines.add((line + "\n").getBytes(StandardCharsets.UTF_8));
+            }
+          } else if (name.startsWith("resources/") && resourcesSeen.add(name)) {
+            // Defer writing; handled in pass 2.
+          }
+          zin.closeEntry();
+        }
+      }
+    }
+
+    // Pass 2: write merged zip.
+    try (ZipOutputStream zout = new ZipOutputStream(Files.newOutputStream(output))) {
+      writeZipEntry(zout, "trace.json", traceLines);
+      writeZipEntry(zout, "network.json", networkLines);
+
+      // Re-stream resource files.
+      for (Path chunk : chunks) {
+        if (!Files.exists(chunk)) continue;
+        try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(chunk))) {
+          ZipEntry entry;
+          while ((entry = zin.getNextEntry()) != null) {
+            String name = entry.getName();
+            byte[] data = zin.readAllBytes();
+            if (name.startsWith("resources/") && resourcesSeen.remove(name)) {
+              zout.putNextEntry(new ZipEntry(name));
+              zout.write(data);
+              zout.closeEntry();
+            }
+            zin.closeEntry();
           }
         }
-        try {
-          context.tracing().groupEnd();
-        } catch (Exception e) {
-          LOG.log(Level.FINE, "tracing.groupEnd failed for session " + sessionId, e);
-        }
       }
-    } finally {
-      try {
-        browser.close();
-      } catch (Exception ignored) {
+    }
+  }
+
+  private static void writeZipEntry(ZipOutputStream zout, String name, List<byte[]> lines)
+      throws IOException {
+    zout.putNextEntry(new ZipEntry(name));
+    for (byte[] line : lines) zout.write(line);
+    zout.closeEntry();
+  }
+
+  // ---- Playwright helpers (run on playwrightThread) ------------------------
+
+  private void safeGroup(SessionTraceContext ctx, String label) {
+    try {
+      ctx.context().tracing().group(label);
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "tracing.group failed for " + ctx.sessionId(), e);
+    }
+  }
+
+  private void safeGroupClose(SessionTraceContext ctx) {
+    try {
+      ctx.context().tracing().groupEnd();
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "tracing.groupEnd failed for " + ctx.sessionId(), e);
+    }
+  }
+
+  /**
+   * Fires a lightweight {@code page.evaluate("1")} to trigger Playwright's DOM snapshot machinery.
+   * Because {@code evaluate()} is a Playwright action, the tracer automatically captures a DOM
+   * snapshot immediately before and after it runs — this is what the {@code trace.playwright.dev}
+   * viewer shows as the "DOM preview" for an action.
+   */
+  private void safeDomSnapshot(SessionTraceContext ctx) {
+    try {
+      List<Page> pages = ctx.context().pages();
+      if (!pages.isEmpty()) {
+        pages.get(0).evaluate("1");
       }
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "DOM snapshot failed for " + ctx.sessionId(), e);
     }
   }
 
