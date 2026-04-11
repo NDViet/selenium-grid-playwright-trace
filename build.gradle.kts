@@ -57,6 +57,21 @@ tasks.test {
 
 val playwrightPlatforms = listOf("linux", "linux-arm64", "mac", "mac-arm64", "win32_x64")
 
+// Derives the Playwright platform classifier from JVM system properties so callers
+// never need to hardcode it (used by shadowJarCurrentPlatform and the README examples).
+fun currentPlatform(): String {
+    val os   = System.getProperty("os.name").lowercase()
+    val arch = System.getProperty("os.arch").lowercase()
+    return when {
+        os.contains("linux") && arch == "aarch64"                       -> "linux-arm64"
+        os.contains("linux")                                             -> "linux"
+        (os.contains("mac") || os.contains("darwin")) && arch == "aarch64" -> "mac-arm64"
+        os.contains("mac") || os.contains("darwin")                     -> "mac"
+        os.contains("win")                                               -> "win32_x64"
+        else -> error("Unsupported platform: os.name=$os, os.arch=$arch")
+    }
+}
+
 // Sources and Javadoc JARs — required by Maven Central.
 val sourcesJar by tasks.registering(Jar::class) {
     archiveClassifier = "sources"
@@ -91,6 +106,16 @@ val platformJarTasks = playwrightPlatforms.map { platform ->
         playwrightPlatforms.filter { it != platform }.forEach { exclude("driver/$it/**") }
         mergeServiceFiles()
     }
+}
+
+// Builds the platform-specific JAR for the machine running the build — no hardcoding required.
+// Equivalent to ./gradlew shadowJar-linux, shadowJar-mac-arm64, etc. for the current host.
+tasks.register("shadowJarCurrentPlatform") {
+    group = "shadow"
+    description = "Assembles the platform-specific fat JAR for the current host OS/arch."
+    val platform = currentPlatform()
+    dependsOn("shadowJar-$platform")
+    doLast { println("Built platform JAR for: $platform") }
 }
 
 // Make 'build' produce universal + all platform JARs.
