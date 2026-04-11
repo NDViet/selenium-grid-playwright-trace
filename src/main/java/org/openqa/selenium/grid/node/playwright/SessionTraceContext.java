@@ -1,12 +1,11 @@
 package org.openqa.selenium.grid.node.playwright;
 
-import com.microsoft.playwright.BrowserContext;
 import java.nio.file.Path;
 
-/** Holds Playwright state for a single active session being traced. */
+/** Holds lightweight, connection-free state for a single active session being traced. */
 class SessionTraceContext {
 
-  private final BrowserContext context;
+  private final String cdpWsUrl;
   private final Path traceDir;
   private final String sessionId;
 
@@ -15,14 +14,14 @@ class SessionTraceContext {
   // Accessed only from the WebDriver command thread (sequential per session), no sync needed.
   private String lastSelector;
 
-  SessionTraceContext(BrowserContext context, Path traceDir, String sessionId) {
-    this.context = context;
+  SessionTraceContext(String cdpWsUrl, Path traceDir, String sessionId) {
+    this.cdpWsUrl = cdpWsUrl;
     this.traceDir = traceDir;
     this.sessionId = sessionId;
   }
 
-  BrowserContext context() {
-    return context;
+  String cdpWsUrl() {
+    return cdpWsUrl;
   }
 
   Path traceDir() {

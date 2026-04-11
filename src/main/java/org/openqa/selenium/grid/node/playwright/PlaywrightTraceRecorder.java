@@ -153,6 +153,13 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   private final ConcurrentHashMap<SessionId, SessionTraceContext> sessions =
       new ConcurrentHashMap<>();
 
+  // Holds a short-lived Browser connection opened at the start of a WebDriver command for
+  // trace annotation (group open). The matching close task (groupEnd + disconnect) removes it.
+  // Both tasks are submitted to the single-threaded playwrightThread so they always execute
+  // in the correct open-then-close order without explicit coordination.
+  private final ConcurrentHashMap<SessionId, Browser> activeCommandBrowsers =
+      new ConcurrentHashMap<>();
+
   private final AtomicBoolean closed = new AtomicBoolean(false);
   private final AtomicBoolean playwrightInitialized = new AtomicBoolean(false);
 
@@ -259,7 +266,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     // session teardown (next.call()) always proceeds.
     if (isDeleteSession(req, id)) {
       try {
-        // FIFO ordering guarantees pending group/capture tasks complete before this runs.
+        // FIFO ordering guarantees any pending annotation tasks complete before this runs.
+        // stopAndSaveTrace connects to CDP, flushes the trace, then disconnects — all within
+        // the submitted task, so there is no lingering WebSocket after it completes.
         playwrightThread.submit(() -> stopAndSaveTrace(id)).get(15, TimeUnit.SECONDS);
       } catch (Exception e) {
         LOG.log(Level.WARNING, "Trace save before session delete failed for " + id, e);
@@ -267,8 +276,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       return next.call();
     }
 
-    // All other commands: annotate the trace best-effort. Any exception in the classification
-    // or submission logic must be swallowed so next.call() is always reached.
+    // All other commands: annotate the trace best-effort via a short-lived CDP connection.
+    // connect-open-group and groupEnd-disconnect are submitted as two consecutive tasks on the
+    // single-threaded playwrightThread, so they always run in order without explicit locking.
     boolean groupOpen = false;
     try {
       if (isFindElement(req)) {
@@ -277,7 +287,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         if (selector != null) ctx.setLastSelector(selector);
       } else if (shouldTrace(req) && !isSeleniumAtomScript(req)) {
         String label = buildLabel(req, ctx);
-        playwrightThread.submit(() -> safeGroup(ctx, label));
+        playwrightThread.submit(() -> connectAndOpenGroup(id, ctx, label));
         groupOpen = true;
       }
     } catch (Exception e) {
@@ -286,14 +296,10 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
     HttpResponse response = next.call(); // Always reached.
 
-    // Fire-and-forget: DOM snapshot + group close. Only if we successfully opened a group.
+    // Fire-and-forget: DOM snapshot + group close + disconnect.
     if (groupOpen) {
       try {
-        playwrightThread.submit(
-            () -> {
-              if (snapshots) safeDomSnapshot(ctx);
-              safeGroupClose(ctx);
-            });
+        playwrightThread.submit(() -> snapshotCloseAndDisconnect(id));
       } catch (Exception e) {
         LOG.log(Level.FINE, "Trace post-command failed for session " + id, e);
       }
@@ -388,8 +394,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       LOG.warning("Playwright not initialised; skipping trace for session " + sessionId);
       return;
     }
+    Browser browser = null;
     try {
-      Browser browser =
+      browser =
           playwright
               .chromium()
               .connectOverCDP(
@@ -403,8 +410,8 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         return;
       }
 
-      BrowserContext context = contexts.get(0);
-      context
+      contexts
+          .get(0)
           .tracing()
           .start(
               new Tracing.StartOptions()
@@ -412,20 +419,43 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
                   .setSnapshots(snapshots)
                   .setSources(false));
 
-      sessions.put(sessionId, new SessionTraceContext(context, outputDir, sessionId.toString()));
+      // Register the session before disconnecting so intercept() can find it.
+      sessions.put(
+          sessionId, new SessionTraceContext(cdpWsUrl, sessionTraceDir, sessionId.toString()));
 
       LOG.info(
           String.format(
-              "Playwright trace started for session %s (%s)",
+              "Playwright trace started for session %s (%s) — CDP connection released",
               sessionId, data.getCapabilities().getBrowserName()));
     } catch (Exception e) {
       LOG.log(
           Level.WARNING,
           "Failed to connect Playwright for session " + sessionId + " at " + cdpWsUrl,
           e);
+    } finally {
+      // Disconnect immediately. Chrome continues tracing internally; we reconnect on-demand
+      // per WebDriver command and again at session end to stop and save the trace.
+      // This ensures no persistent CDP WebSocket is held, allowing the Node's session-timeout
+      // to fire normally when a client disconnects without deleting the session.
+      if (browser != null) {
+        try {
+          browser.close();
+        } catch (Exception ignored) {
+        }
+      }
     }
   }
 
+  /**
+   * Reconnects to the browser via CDP, stops Chrome's tracing, saves the trace zip, then
+   * disconnects. Must run on {@code playwrightThread}.
+   *
+   * <p>Chrome's {@code Tracing.start} is a global browser-level operation that persists across CDP
+   * WebSocket connections. Calling {@code tracing().stop()} on a fresh {@link BrowserContext}
+   * obtained via a new {@code connectOverCDP()} sends {@code Tracing.end()} to Chrome, which
+   * responds with all buffered {@code Tracing.dataCollected} events regardless of which CDP client
+   * originally started the trace.
+   */
   private void stopAndSaveTrace(SessionId sessionId) {
     SessionTraceContext ctx = sessions.remove(sessionId);
     if (ctx == null) {
@@ -433,17 +463,93 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       return;
     }
     Path tracePath = ctx.traceDir().resolve("trace_" + sessionId + ".zip");
+    Browser browser = null;
     try {
-      ctx.context().tracing().stop(new Tracing.StopOptions().setPath(tracePath));
+      browser =
+          playwright
+              .chromium()
+              .connectOverCDP(
+                  ctx.cdpWsUrl(),
+                  new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
+                      .setTimeout(10_000));
+      List<BrowserContext> contexts = browser.contexts();
+      if (contexts.isEmpty()) {
+        LOG.warning("No browser contexts on stop for session " + sessionId);
+        return;
+      }
+      contexts.get(0).tracing().stop(new Tracing.StopOptions().setPath(tracePath));
       LOG.info("Playwright trace saved for session " + sessionId + ": " + tracePath);
     } catch (Exception e) {
-      LOG.log(Level.WARNING, "Error stopping trace for session " + sessionId, e);
+      LOG.log(Level.WARNING, "Error stopping/saving trace for session " + sessionId, e);
+    } finally {
+      if (browser != null) {
+        try {
+          browser.close();
+        } catch (Exception ignored) {
+        }
+      }
     }
-    // Do NOT call browser.close() here. The WebDriver session is still alive at this point
-    // (next.call() hasn't run yet for the DELETE /session path, or the session closed
-    // abnormally). Closing the browser from here disconnects the CDP endpoint prematurely
-    // and causes RejectedExecutionException in the Node's WebSocket proxy shutdown path.
-    // The browser and CDP connection are torn down naturally when the WebDriver session ends.
+  }
+
+  /**
+   * Opens a short-lived CDP connection, opens a trace group for the given label, and stores the
+   * {@link Browser} handle in {@code activeCommandBrowsers} for the matching close task. Must run
+   * on {@code playwrightThread}.
+   */
+  private void connectAndOpenGroup(SessionId sessionId, SessionTraceContext ctx, String label) {
+    try {
+      Browser browser =
+          playwright
+              .chromium()
+              .connectOverCDP(
+                  ctx.cdpWsUrl(),
+                  new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
+                      .setTimeout(5_000));
+      List<BrowserContext> contexts = browser.contexts();
+      if (contexts.isEmpty()) {
+        browser.close();
+        return;
+      }
+      contexts.get(0).tracing().group(label);
+      activeCommandBrowsers.put(sessionId, browser);
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "CDP connect/group open failed for session " + sessionId, e);
+    }
+  }
+
+  /**
+   * Fires a DOM snapshot, closes the trace group, then disconnects the short-lived connection
+   * opened by {@link #connectAndOpenGroup}. Must run on {@code playwrightThread}.
+   */
+  private void snapshotCloseAndDisconnect(SessionId sessionId) {
+    Browser browser = activeCommandBrowsers.remove(sessionId);
+    if (browser == null) return;
+    try {
+      List<BrowserContext> contexts = browser.contexts();
+      if (!contexts.isEmpty()) {
+        BrowserContext context = contexts.get(0);
+        if (snapshots) {
+          List<Page> pages = context.pages();
+          if (!pages.isEmpty()) {
+            try {
+              pages.get(0).evaluate("1");
+            } catch (Exception e) {
+              LOG.log(Level.FINE, "DOM snapshot failed for session " + sessionId, e);
+            }
+          }
+        }
+        try {
+          context.tracing().groupEnd();
+        } catch (Exception e) {
+          LOG.log(Level.FINE, "tracing.groupEnd failed for session " + sessionId, e);
+        }
+      }
+    } finally {
+      try {
+        browser.close();
+      } catch (Exception ignored) {
+      }
+    }
   }
 
   private void closePlaywright() {
@@ -453,45 +559,6 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       } catch (Exception e) {
         LOG.log(Level.FINE, "Error closing Playwright", e);
       }
-    }
-  }
-
-  // ---- Playwright helpers (run on playwrightThread) ------------------------
-
-  private void safeGroup(SessionTraceContext ctx, String label) {
-    try {
-      ctx.context().tracing().group(label);
-    } catch (Exception e) {
-      LOG.log(Level.FINE, "tracing.group failed for " + ctx.sessionId(), e);
-    }
-  }
-
-  private void safeGroupClose(SessionTraceContext ctx) {
-    try {
-      ctx.context().tracing().groupEnd();
-    } catch (Exception e) {
-      LOG.log(Level.FINE, "tracing.groupEnd failed for " + ctx.sessionId(), e);
-    }
-  }
-
-  /**
-   * Fires a lightweight {@code page.evaluate("1")} to trigger Playwright's DOM snapshot machinery.
-   * Because {@code evaluate()} is a Playwright action, the tracer automatically captures a DOM
-   * snapshot immediately before and after it runs — this is what the {@code trace.playwright.dev}
-   * viewer shows as the "DOM preview" for an action.
-   *
-   * <p>The evaluated expression {@code "1"} is a no-op that returns immediately; no meaningful JS
-   * is executed in the browser. Only the CDP round-trip cost is paid (~1–5 ms), and this runs
-   * fire-and-forget on the Playwright thread so no latency is added to the WebDriver path.
-   */
-  private void safeDomSnapshot(SessionTraceContext ctx) {
-    try {
-      List<Page> pages = ctx.context().pages();
-      if (!pages.isEmpty()) {
-        pages.get(0).evaluate("1");
-      }
-    } catch (Exception e) {
-      LOG.log(Level.FINE, "DOM snapshot failed for " + ctx.sessionId(), e);
     }
   }
 
