@@ -3,33 +3,49 @@ package org.openqa.selenium.grid.node.playwright;
 import com.microsoft.playwright.Browser;
 import com.microsoft.playwright.BrowserContext;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /** Holds Playwright state for a single active session being traced. */
 class SessionTraceContext {
 
-  private final Browser browser;
-  private final BrowserContext context;
   private final Path traceDir;
+  private final String cdpUrl;
   private final String sessionId;
-
-  // Chunk files written by stopChunk() after each traced command.
-  // Accessed only from playwrightThread (single-threaded FIFO), no sync needed.
-  private final List<Path> chunks = new ArrayList<>();
-  private int chunkIndex = 0;
+  private final String traceName;
+  private Browser browser;
+  private BrowserContext context;
+  private boolean tracingStarted;
 
   // Selector stored by a findElement call so the immediately following element action
   // (click, type, etc.) can include it in its label, e.g. "Click — #submit".
-  // Accessed only from the WebDriver command thread (sequential per session), no sync needed.
   private String lastSelector;
+  private final Map<String, String> elementSelectors = new HashMap<>();
+  private final Map<String, String> verificationStates = new LinkedHashMap<>();
 
-  SessionTraceContext(Browser browser, BrowserContext context, Path traceDir, String sessionId) {
-    this.browser = browser;
-    this.context = context;
+  SessionTraceContext(Path traceDir, String cdpUrl, String sessionId, String traceName) {
     this.traceDir = traceDir;
+    this.cdpUrl = cdpUrl;
     this.sessionId = sessionId;
+    this.traceName = traceName;
+  }
+
+  Path traceDir() {
+    return traceDir;
+  }
+
+  String cdpUrl() {
+    return cdpUrl;
+  }
+
+  String sessionId() {
+    return sessionId;
+  }
+
+  String traceName() {
+    return traceName;
   }
 
   Browser browser() {
@@ -40,35 +56,67 @@ class SessionTraceContext {
     return context;
   }
 
-  Path traceDir() {
-    return traceDir;
+  boolean hasConnection() {
+    return browser != null && context != null;
   }
 
-  String sessionId() {
-    return sessionId;
+  void setConnection(Browser browser, BrowserContext context) {
+    this.browser = browser;
+    this.context = context;
   }
 
-  /** Returns the path for the next chunk file and advances the counter. */
-  Path nextChunkPath() {
-    return traceDir.resolve("trace_" + sessionId + "_chunk_" + chunkIndex++ + ".zip");
+  void clearConnection() {
+    browser = null;
+    context = null;
+    tracingStarted = false;
   }
 
-  void addChunk(Path chunk) {
-    chunks.add(chunk);
+  boolean isTracingStarted() {
+    return tracingStarted;
   }
 
-  List<Path> chunks() {
-    return Collections.unmodifiableList(chunks);
+  void setTracingStarted(boolean tracingStarted) {
+    this.tracingStarted = tracingStarted;
   }
 
-  void setLastSelector(String selector) {
+  synchronized void setLastSelector(String selector) {
     this.lastSelector = selector;
   }
 
+  synchronized String peekLastSelector() {
+    return lastSelector;
+  }
+
   /** Returns the stored selector and clears it so it is only consumed once. */
-  String consumeLastSelector() {
+  synchronized String consumeLastSelector() {
     String s = lastSelector;
     lastSelector = null;
     return s;
+  }
+
+  synchronized void rememberElementSelector(String elementId, String selector) {
+    if (elementId != null && selector != null) {
+      elementSelectors.put(elementId, selector);
+    }
+  }
+
+  synchronized String selectorForElement(String elementId) {
+    return elementId == null ? null : elementSelectors.get(elementId);
+  }
+
+  synchronized boolean shouldRecordVerificationState(String key, String state) {
+    if (key == null || state == null || state.equals(verificationStates.get(key))) {
+      return false;
+    }
+    verificationStates.put(key, state);
+    while (verificationStates.size() > 200) {
+      Iterator<String> keys = verificationStates.keySet().iterator();
+      if (!keys.hasNext()) {
+        break;
+      }
+      keys.next();
+      keys.remove();
+    }
+    return true;
   }
 }

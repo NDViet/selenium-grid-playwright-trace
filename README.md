@@ -166,9 +166,10 @@ npx playwright show-trace trace_<sessionId>.zip
 ## How it works
 
 1. The interceptor is loaded via Java `ServiceLoader` — it stands by with zero overhead until a session that should be traced is created.
-2. When a traced session starts and advertises `se:cdp`, Playwright connects to the browser over CDP and begins recording.
-3. Each WebDriver command is wrapped in a named trace group (e.g. `Click — #submit`) and a lightweight `page.evaluate("1")` is fired after the command so Playwright captures before/after DOM snapshots.
-4. When the session ends (`DELETE /session`) the trace is flushed and saved.
+2. When a traced session starts and advertises `se:cdp`, the extension stores the direct Node CDP endpoint and connects lazily on the first meaningful command.
+3. A single Playwright trace is started for the session. Each meaningful WebDriver command is wrapped in a named trace group (e.g. `Click — #submit`) and a lightweight `page.evaluate("1")` after the command so Playwright captures DOM snapshots.
+4. Playwright owns trace resource storage for the whole session; the recorder no longer splits command chunks or merges trace zip files.
+5. When the session ends (`DELETE /session`, timeout, or node shutdown), Playwright writes `trace_<sessionId>.zip` directly.
 
 ## Building from source
 
@@ -196,3 +197,22 @@ npx playwright show-trace trace_<sessionId>.zip
 # Build against nightly Selenium
 ./gradlew shadowJar -PseleniumVersion=4.43.0-SNAPSHOT
 ```
+
+## End-to-End Trace Evaluation
+
+Run the Grid-backed e2e harness:
+
+```bash
+./gradlew e2eTest --rerun-tasks
+```
+
+The task downloads `selenium-server-4.43.0.jar` from the Selenium GitHub release, builds the
+current-platform extension JAR, starts a Hub and Node with `--ext`, drives Selenium Chrome through
+rich public sites (`katalon.com`, `saucelabs.com`, and `browserstack.com`), clicks navigation links,
+and verifies a Playwright trace zip was created.
+
+Artifacts are left under:
+
+- `build/e2e/traces/<run-id>/trace_<sessionId>.zip`
+- `build/e2e/logs/<run-id>/hub.log`
+- `build/e2e/logs/<run-id>/node.log`

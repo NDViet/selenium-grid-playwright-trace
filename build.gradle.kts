@@ -51,6 +51,20 @@ dependencies {
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine:5.11.4")
 }
 
+val e2eTestSourceSet = sourceSets.create("e2eTest") {
+    java.srcDir("src/e2eTest/java")
+    resources.srcDir("src/e2eTest/resources")
+    compileClasspath += sourceSets.main.get().output + configurations.testRuntimeClasspath.get()
+    runtimeClasspath += output + compileClasspath
+}
+
+configurations[e2eTestSourceSet.implementationConfigurationName].extendsFrom(configurations.testImplementation.get())
+configurations[e2eTestSourceSet.runtimeOnlyConfigurationName].extendsFrom(configurations.testRuntimeOnly.get())
+
+dependencies {
+    add("e2eTestImplementation", "org.seleniumhq.selenium:selenium-java:4.43.0")
+}
+
 tasks.test {
     useJUnitPlatform()
 }
@@ -116,6 +130,54 @@ tasks.register("shadowJarCurrentPlatform") {
     val platform = currentPlatform()
     dependsOn("shadowJar-$platform")
     doLast { println("Built platform JAR for: $platform") }
+}
+
+val seleniumServerVersion = "4.43.0"
+val seleniumServerJar = layout.buildDirectory.file("e2e/selenium-server-$seleniumServerVersion.jar")
+
+tasks.register("downloadSeleniumServer") {
+    group = "verification"
+    description = "Downloads selenium-server-$seleniumServerVersion.jar for the end-to-end trace test."
+    outputs.file(seleniumServerJar)
+    doLast {
+        val output = seleniumServerJar.get().asFile
+        if (output.isFile && output.length() > 0) {
+            return@doLast
+        }
+        output.parentFile.mkdirs()
+        val url = uri(
+            "https://github.com/SeleniumHQ/selenium/releases/download/selenium-$seleniumServerVersion/selenium-server-$seleniumServerVersion.jar"
+        ).toURL()
+        url.openStream().use { input ->
+            output.outputStream().use { outputStream ->
+                input.copyTo(outputStream)
+            }
+        }
+    }
+}
+
+tasks.register<Test>("e2eTest") {
+    group = "verification"
+    description = "Starts Selenium Grid Hub/Node with this extension and records Playwright trace zips."
+    testClassesDirs = e2eTestSourceSet.output.classesDirs
+    classpath = e2eTestSourceSet.runtimeClasspath
+    useJUnitPlatform()
+    systemProperty("junit.jupiter.execution.parallel.enabled", "true")
+    systemProperty("junit.jupiter.execution.parallel.mode.default", "concurrent")
+    systemProperty("junit.jupiter.execution.parallel.mode.classes.default", "concurrent")
+    systemProperty("junit.jupiter.execution.parallel.config.strategy", "fixed")
+    systemProperty(
+        "junit.jupiter.execution.parallel.config.fixed.parallelism",
+        providers.gradleProperty("e2eParallelism").orElse("3").get()
+    )
+    dependsOn("shadowJarCurrentPlatform", "downloadSeleniumServer")
+    shouldRunAfter(tasks.test)
+    systemProperty("e2e.seleniumServerJar", seleniumServerJar.get().asFile.absolutePath)
+    systemProperty(
+        "e2e.extensionJar",
+        layout.buildDirectory.file("libs/${project.name}-$version-${currentPlatform()}.jar").get().asFile.absolutePath
+    )
+    systemProperty("e2e.outputDir", layout.buildDirectory.dir("e2e").get().asFile.absolutePath)
 }
 
 // Make 'build' produce universal + all platform JARs.

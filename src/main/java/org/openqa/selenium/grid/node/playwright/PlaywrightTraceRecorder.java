@@ -10,14 +10,17 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
-import java.util.HashSet;
+import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -29,9 +32,10 @@ import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
-import java.util.zip.ZipOutputStream;
 import org.openqa.selenium.events.EventBus;
 import org.openqa.selenium.grid.config.Config;
+import org.openqa.selenium.grid.data.SessionClosedData;
+import org.openqa.selenium.grid.data.SessionClosedEvent;
 import org.openqa.selenium.grid.data.SessionCreatedData;
 import org.openqa.selenium.grid.data.SessionCreatedEvent;
 import org.openqa.selenium.grid.node.NodeCommandInterceptor;
@@ -48,13 +52,15 @@ import org.openqa.selenium.remote.http.HttpResponse;
  * <ol>
  *   <li>The interceptor is always loaded by the ServiceLoader and stands by with zero overhead
  *       until a session that should be traced is created.
- *   <li>When a traced session starts and advertises {@code se:cdp}, Playwright connects to the
- *       browser over CDP and begins recording (screenshots + DOM snapshots).
- *   <li>Each meaningful WebDriver command opens a named trace group with a semantic action label
- *       (e.g. {@code "Navigate — https://example.com"}, {@code "Click — #submit"}). A lightweight
- *       {@code page.evaluate("1")} is fired after the command so Playwright captures before/after
- *       DOM snapshots — this populates the DOM preview in {@code trace.playwright.dev}.
- *   <li>When the session ends the trace is saved as {@code trace_<sessionId>.zip}.
+ *   <li>When a traced session starts and advertises {@code se:cdp}, the recorder stores the direct
+ *       Node CDP endpoint but does not connect yet.
+ *   <li>Each meaningful WebDriver command gets a named trace group with a semantic action label
+ *       (e.g. {@code "Navigate — https://example.com"}, {@code "Click — #submit"}) and a
+ *       lightweight {@code page.evaluate("1")} after the command so Playwright captures DOM
+ *       snapshots. A single Playwright tracing context stays open for the session so Playwright
+ *       writes the final trace zip and its resources natively.
+ *   <li>When the session ends the trace is saved as {@code trace_<se:name>_<sessionId>.zip}, or
+ *       {@code trace_<sessionId>.zip} when {@code se:name} is not set.
  * </ol>
  *
  * <h2>Activation</h2>
@@ -89,11 +95,12 @@ import org.openqa.selenium.remote.http.HttpResponse;
  * <ul>
  *   <li><b>Thread safety:</b> a single dedicated thread owns the {@link Playwright} instance. All
  *       Playwright calls are posted to it; Playwright's thread-affinity requirement is met.
- *   <li><b>Lazy init:</b> Playwright is initialised on the first session that needs tracing, not at
- *       node startup. Nodes where no session requests tracing pay zero CDP overhead.
- *   <li><b>Zero latency:</b> group open/close and DOM snapshots are fire-and-forget. The only
- *       intentional block is on DELETE /session, where the trace must be flushed before the CDP
- *       connection closes.
+ *   <li><b>Lazy init:</b> Playwright is initialised on the first command that needs tracing, not at
+ *       node startup. Nodes where no command is traced pay zero CDP overhead.
+ *   <li><b>Native trace zip:</b> Playwright owns trace storage and writes the final zip on session
+ *       close; the recorder does not split or merge trace chunks.
+ *   <li><b>Lazy connection:</b> CDP is connected only after the first meaningful command and is
+ *       closed after Playwright finishes writing the session trace.
  * </ul>
  *
  * <h2>Usage</h2>
@@ -145,6 +152,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
   /** WebDriver capability that overrides the global default per session. */
   static final String CAP_RECORD_TRACE = "se:recordTrace";
+
+  /** WebDriver capability used to name the trace file. */
+  static final String CAP_SESSION_NAME = "se:name";
 
   // All Playwright operations must run on this single thread (thread-affinity requirement).
   private final ExecutorService playwrightThread =
@@ -204,6 +214,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
             globalEnabled, outputDir, screenshots, snapshots));
 
     bus.addListener(SessionCreatedEvent.listener(this::onSessionCreated));
+    bus.addListener(SessionClosedEvent.listener(this::onSessionClosed));
 
     // Playwright is initialised lazily on the first session that needs tracing.
     // Fallback shutdown hook: a no-op when LocalNode already called close().
@@ -229,13 +240,12 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     if (!closed.compareAndSet(false, true)) {
       return; // already closed
     }
-    // Snapshot to avoid ConcurrentModificationException — stopAndSaveTrace removes from map.
+    // Snapshot to avoid ConcurrentModificationException — completeSessionTrace removes from map.
     List<SessionId> remaining = new ArrayList<>(sessions.keySet());
     if (!remaining.isEmpty()) {
       LOG.info("Node shutting down; saving " + remaining.size() + " active trace(s)");
       for (SessionId sessionId : remaining) {
-        playwrightThread.submit(() -> stopAndSaveTrace(sessionId));
-        playwrightThread.submit(() -> disconnectBrowser(sessionId));
+        playwrightThread.submit(() -> completeSessionTrace(sessionId));
       }
     }
     playwrightThread.submit(this::closePlaywright);
@@ -260,60 +270,52 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       return next.call();
     }
 
-    // DELETE /session/{id}: stop the trace before next.call() so the trace is flushed while
-    // the CDP connection is still alive. Best-effort — any failure is caught so the actual
-    // session teardown (next.call()) always proceeds.
     if (isDeleteSession(req, id)) {
       try {
-        // FIFO ordering guarantees pending group/snapshot tasks complete before this runs.
-        playwrightThread.submit(() -> stopAndSaveTrace(id)).get(15, TimeUnit.SECONDS);
+        playwrightThread.submit(() -> completeSessionTrace(id)).get(15, TimeUnit.SECONDS);
       } catch (Exception e) {
         LOG.log(Level.WARNING, "Trace save before session delete failed for " + id, e);
       }
-      HttpResponse response = next.call();
-      // Disconnect after next.call() — the session is now gone so the browser.close() here
-      // only severs Playwright's direct Chrome CDP connection without touching any Selenium proxy.
-      playwrightThread.submit(() -> disconnectBrowser(id));
-      return response;
+      return next.call();
     }
 
-    // All other commands: annotate the trace best-effort using the persistent Playwright context.
-    boolean groupOpen = false;
+    boolean commandTraceStarted = false;
+    String selector = null;
     try {
       if (isFindElement(req)) {
         // Silent — capture selector for label enrichment on the next element action.
-        String selector = extractSelector(req);
+        selector = extractSelector(req);
         if (selector != null) ctx.setLastSelector(selector);
       } else if (shouldTrace(req) && !isSeleniumAtomScript(req)) {
         String label = buildLabel(req, ctx);
-        playwrightThread.submit(() -> safeGroup(ctx, label));
-        groupOpen = true;
+        try {
+          commandTraceStarted =
+              playwrightThread
+                  .submit(() -> startCommandTrace(id, ctx, label))
+                  .get(15, TimeUnit.SECONDS);
+        } catch (Exception e) {
+          LOG.log(Level.FINE, "Trace pre-command failed for session " + id, e);
+        }
       }
     } catch (Exception e) {
       LOG.log(Level.FINE, "Trace pre-command failed for session " + id, e);
     }
 
-    HttpResponse response = next.call(); // Always reached.
-
-    // Fire-and-forget: DOM snapshot + group close + flush chunk to disk.
-    if (groupOpen) {
-      try {
-        playwrightThread.submit(
-            () -> {
-              if (snapshots) safeDomSnapshot(ctx);
-              safeGroupClose(ctx);
-              // Persist this command's trace events to disk immediately.
-              // Each stopChunk() + startChunk() pair atomically flushes the current chunk
-              // and opens the next one — Chrome's tracing continues uninterrupted.
-              // This means the trace is always up-to-date on disk: if the JVM crashes or the
-              // session is abandoned, all completed commands are already saved as chunk files.
-              safeFlushChunk(id, ctx);
-            });
-      } catch (Exception e) {
-        LOG.log(Level.FINE, "Trace post-command failed for session " + id, e);
+    HttpResponse response = null;
+    try {
+      response = next.call();
+      return response;
+    } finally {
+      if (commandTraceStarted) {
+        try {
+          playwrightThread.submit(() -> finishCommandTrace(id, ctx)).get(15, TimeUnit.SECONDS);
+        } catch (Exception e) {
+          LOG.log(Level.FINE, "Trace post-command failed for session " + id, e);
+        }
+      } else if (response != null) {
+        cachePendingVerification(id, ctx, req, response, selector);
       }
     }
-    return response;
   }
 
   // ---- Session lifecycle (called from EventBus listener threads) -----------
@@ -344,6 +346,8 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     }
 
     SessionId sessionId = data.getSessionId();
+    String traceName =
+        traceFileName(data.getCapabilities().getCapability(CAP_SESSION_NAME), sessionId.toString());
 
     Object cdpCap = data.getCapabilities().getCapability("se:cdp");
     if (cdpCap == null) {
@@ -364,8 +368,27 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
             "%s://%s:%d%s/session/%s/se/cdp",
             wsScheme, nodeUri.getHost(), port, subPath, sessionId);
 
-    LOG.info("Connecting Playwright tracer for session " + sessionId + " via " + cdpWsUrl);
-    playwrightThread.submit(() -> connectAndStartTrace(sessionId, cdpWsUrl, outputDir, data));
+    try {
+      Path sessionTraceDir =
+          Files.createTempDirectory(outputDir, "trace_" + sessionId.toString() + "_");
+      sessions.put(
+          sessionId,
+          new SessionTraceContext(sessionTraceDir, cdpWsUrl, sessionId.toString(), traceName));
+      LOG.info(
+          String.format(
+              "Playwright trace recorder armed for session %s (%s)",
+              sessionId, data.getCapabilities().getBrowserName()));
+    } catch (IOException e) {
+      LOG.log(Level.WARNING, "Cannot create trace workspace for session " + sessionId, e);
+    }
+  }
+
+  private void onSessionClosed(SessionClosedData data) {
+    SessionId sessionId = data.getSessionId();
+    if (!sessions.containsKey(sessionId)) {
+      return;
+    }
+    playwrightThread.submit(() -> completeSessionTrace(sessionId));
   }
 
   // ---- Playwright operations (must run on playwrightThread) ----------------
@@ -394,220 +417,232 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     }
   }
 
-  private void connectAndStartTrace(
-      SessionId sessionId, String cdpUrl, Path sessionTraceDir, SessionCreatedData data) {
+  private boolean startCommandTrace(SessionId sessionId, SessionTraceContext ctx, String label) {
     ensurePlaywrightInitialized();
     if (playwright == null) {
       LOG.warning("Playwright not initialised; skipping trace for session " + sessionId);
-      return;
+      return false;
     }
     try {
-      Browser browser =
-          playwright
-              .chromium()
-              .connectOverCDP(
-                  cdpUrl,
-                  new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
-                      .setTimeout(10_000));
-
-      List<BrowserContext> contexts = browser.contexts();
-      if (contexts.isEmpty()) {
-        LOG.warning("No browser contexts for session " + sessionId + "; skipping trace");
-        browser.close();
-        return;
+      ensureConnected(sessionId, ctx);
+      if (!ctx.hasConnection()) {
+        return false;
       }
-
-      BrowserContext context = contexts.get(0);
-      context
-          .tracing()
-          .start(
-              new Tracing.StartOptions()
-                  .setScreenshots(screenshots)
-                  .setSnapshots(snapshots)
-                  .setSources(false));
-
-      // Enter chunk mode immediately so every command's events can be flushed to disk via
-      // stopChunk() + startChunk() without stopping the overall trace.
-      context.tracing().startChunk();
-
-      sessions.put(
-          sessionId,
-          new SessionTraceContext(browser, context, sessionTraceDir, sessionId.toString()));
-
-      LOG.info(
-          String.format(
-              "Playwright trace started for session %s (%s)",
-              sessionId, data.getCapabilities().getBrowserName()));
+      if (!ctx.isTracingStarted()) {
+        ctx.context()
+            .tracing()
+            .start(
+                new Tracing.StartOptions()
+                    .setScreenshots(screenshots)
+                    .setSnapshots(snapshots)
+                    .setSources(false));
+        ctx.setTracingStarted(true);
+      }
+      ctx.context().tracing().group(label);
+      return true;
     } catch (Exception e) {
       LOG.log(
           Level.WARNING,
-          "Failed to connect Playwright for session " + sessionId + " at " + cdpUrl,
+          "Failed to connect Playwright for session " + sessionId + " at " + ctx.cdpUrl(),
           e);
+      closeBrowserConnection(sessionId, ctx);
+      return false;
     }
   }
 
-  private void stopAndSaveTrace(SessionId sessionId) {
+  private void ensureConnected(SessionId sessionId, SessionTraceContext ctx) {
+    if (ctx.hasConnection()) {
+      return;
+    }
+    Browser browser =
+        playwright
+            .chromium()
+            .connectOverCDP(
+                ctx.cdpUrl(),
+                new com.microsoft.playwright.BrowserType.ConnectOverCDPOptions()
+                    .setTimeout(10_000));
+
+    List<BrowserContext> contexts = browser.contexts();
+    if (contexts.isEmpty()) {
+      LOG.warning("No browser contexts for session " + sessionId + "; skipping trace");
+      browser.close();
+      return;
+    }
+    ctx.setConnection(browser, contexts.get(0));
+  }
+
+  private void finishCommandTrace(SessionId sessionId, SessionTraceContext ctx) {
+    try {
+      if (!ctx.hasConnection() || !ctx.isTracingStarted()) {
+        return;
+      }
+      if (snapshots) {
+        safeDomSnapshot(ctx, ctx.context());
+      }
+      safeGroupClose(ctx, ctx.context());
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "Command trace close failed for session " + sessionId, e);
+    }
+  }
+
+  private void completeSessionTrace(SessionId sessionId) {
     SessionTraceContext ctx = sessions.remove(sessionId);
     if (ctx == null) {
       LOG.info("No active trace for session " + sessionId + " — nothing to save");
       return;
     }
-    // Stop the current chunk and save it. This is the last chunk — it covers any commands
-    // that ran after the most recent safeFlushChunk() call (e.g. un-traced GET commands).
-    Path lastChunk = ctx.nextChunkPath();
+    Path tracePath = outputDir.resolve(ctx.traceName());
+    Path tempTracePath =
+        ctx.traceDir()
+            .resolve(
+                "trace_"
+                    + sessionId
+                    + "_"
+                    + UUID.randomUUID().toString().replace("-", "")
+                    + ".tmp.zip");
     try {
-      ctx.context().tracing().stopChunk(new Tracing.StopChunkOptions().setPath(lastChunk));
-      ctx.addChunk(lastChunk);
-    } catch (Exception e) {
-      LOG.log(Level.WARNING, "Error stopping final trace chunk for session " + sessionId, e);
-    }
-
-    Path tracePath = ctx.traceDir().resolve("trace_" + sessionId + ".zip");
-    try {
-      mergeChunks(ctx.chunks(), tracePath);
-      LOG.info("Playwright trace saved for session " + sessionId + ": " + tracePath);
-    } catch (Exception e) {
-      LOG.log(Level.WARNING, "Error merging trace chunks for session " + sessionId, e);
-    } finally {
-      for (Path chunk : ctx.chunks()) {
-        try {
-          Files.deleteIfExists(chunk);
-        } catch (Exception ignored) {
-        }
+      if (saveNativeTrace(sessionId, ctx, tempTracePath)) {
+        moveAtomically(tempTracePath, tracePath);
+        LOG.info("Playwright trace saved for session " + sessionId + ": " + tracePath);
+        deleteRecursively(ctx.traceDir());
+      } else {
+        LOG.info("No Playwright trace recorded for session " + sessionId);
+        deleteRecursively(ctx.traceDir());
       }
+    } catch (Exception e) {
+      LOG.log(Level.WARNING, "Error saving trace for session " + sessionId, e);
+    } finally {
+      try {
+        Files.deleteIfExists(tempTracePath);
+      } catch (IOException ignored) {
+      }
+      closeBrowserConnection(sessionId, ctx);
     }
   }
 
-  private void disconnectBrowser(SessionId sessionId) {
-    SessionTraceContext ctx = sessions.get(sessionId);
-    if (ctx == null) return;
+  private boolean saveNativeTrace(
+      SessionId sessionId, SessionTraceContext ctx, Path tempTracePath) {
+    if (!ctx.hasConnection() || !ctx.isTracingStarted()) {
+      return false;
+    }
     try {
-      ctx.browser().close();
+      ctx.context().tracing().stop(new Tracing.StopOptions().setPath(tempTracePath));
+      ctx.setTracingStarted(false);
+      if (!isValidTraceZip(tempTracePath)) {
+        LOG.warning(
+            "Ignoring invalid Playwright trace for session " + sessionId + ": " + tempTracePath);
+        return false;
+      }
+      return true;
+    } catch (Exception e) {
+      LOG.log(Level.WARNING, "Failed to stop Playwright tracing for session " + sessionId, e);
+      return false;
+    }
+  }
+
+  static String traceFileName(Object rawName, String sessionId) {
+    String safeName = sanitizeTraceName(rawName);
+    if (safeName == null) {
+      return "trace_" + sessionId + ".zip";
+    }
+    return "trace_" + safeName + "_" + sessionId + ".zip";
+  }
+
+  private static String sanitizeTraceName(Object rawName) {
+    if (rawName == null) {
+      return null;
+    }
+    String normalized =
+        rawName.toString().trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9._-]+", "-");
+    normalized = normalized.replaceAll("^-+", "").replaceAll("-+$", "");
+    if (normalized.isEmpty()) {
+      return null;
+    }
+    return normalized.length() > 80 ? normalized.substring(0, 80) : normalized;
+  }
+
+  private void closeBrowserConnection(SessionId sessionId, SessionTraceContext ctx) {
+    Browser browser = ctx.browser();
+    if (browser == null) {
+      return;
+    }
+    try {
+      if (ctx.isTracingStarted()) {
+        try {
+          ctx.context().tracing().stop();
+        } catch (Exception e) {
+          LOG.log(Level.FINE, "Error stopping Playwright tracing for session " + sessionId, e);
+        }
+      }
+      browser.close();
       LOG.fine("Playwright CDP connection released for session " + sessionId);
     } catch (Exception e) {
       LOG.log(Level.FINE, "Error disconnecting browser for session " + sessionId, e);
+    } finally {
+      ctx.clearConnection();
     }
   }
 
-  /**
-   * Flushes the current trace chunk to disk and opens the next one. Must run on {@code
-   * playwrightThread}. Called after every traced command so the trace is always durable: all
-   * completed commands are persisted as chunk files regardless of how the session ends.
-   */
-  private void safeFlushChunk(SessionId sessionId, SessionTraceContext ctx) {
+  private static boolean isValidTraceZip(Path path) {
+    if (!Files.isRegularFile(path)) {
+      return false;
+    }
     try {
-      Path chunkPath = ctx.nextChunkPath();
-      ctx.context().tracing().stopChunk(new Tracing.StopChunkOptions().setPath(chunkPath));
-      ctx.addChunk(chunkPath);
-      ctx.context().tracing().startChunk();
-    } catch (Exception e) {
-      LOG.log(Level.FINE, "Chunk flush failed for session " + sessionId, e);
-    }
-  }
-
-  /**
-   * Merges one or more Playwright trace chunk zip files into a single trace zip.
-   *
-   * <p>Playwright's trace zip layout:
-   *
-   * <pre>
-   * trace.zip
-   * ├── trace.json   — NDJSON; each line is a trace event
-   * ├── network.json — NDJSON; each line is a network event
-   * └── resources/   — content-addressed binary files (screenshots, DOM snapshots)
-   * </pre>
-   *
-   * <p>Merging strategy:
-   *
-   * <ul>
-   *   <li>{@code trace.json} / {@code network.json} — lines from all chunks are concatenated in
-   *       order. The {@code context-options} preamble event that Playwright emits at the start of
-   *       each chunk is deduplicated (only the first occurrence is kept).
-   *   <li>{@code resources/*} — content-addressed so identical names mean identical bytes; the
-   *       first occurrence wins and duplicates are skipped.
-   * </ul>
-   */
-  private static void mergeChunks(List<Path> chunks, Path output) throws IOException {
-    List<byte[]> traceLines = new ArrayList<>();
-    List<byte[]> networkLines = new ArrayList<>();
-    Set<String> resourcesSeen = new HashSet<>();
-    boolean contextOptionsSeen = false;
-
-    // Pass 1: collect lines and resource names.
-    for (Path chunk : chunks) {
-      if (!Files.exists(chunk)) continue;
-      try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(chunk))) {
+      if (Files.size(path) == 0) {
+        return false;
+      }
+      try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(path))) {
         ZipEntry entry;
+        boolean hasTrace = false;
         while ((entry = zin.getNextEntry()) != null) {
-          String name = entry.getName();
-          byte[] data = zin.readAllBytes();
-          if ("trace.json".equals(name)) {
-            for (String line : new String(data, StandardCharsets.UTF_8).split("\n")) {
-              if (line.isBlank()) continue;
-              // Keep only the first context-options preamble across all chunks.
-              if (line.contains("\"context-options\"")) {
-                if (contextOptionsSeen) continue;
-                contextOptionsSeen = true;
-              }
-              traceLines.add((line + "\n").getBytes(StandardCharsets.UTF_8));
-            }
-          } else if ("network.json".equals(name)) {
-            for (String line : new String(data, StandardCharsets.UTF_8).split("\n")) {
-              if (!line.isBlank()) networkLines.add((line + "\n").getBytes(StandardCharsets.UTF_8));
-            }
-          } else if (name.startsWith("resources/") && resourcesSeen.add(name)) {
-            // Defer writing; handled in pass 2.
+          if (isTraceEntry(entry.getName())) {
+            hasTrace = true;
           }
           zin.closeEntry();
         }
+        return hasTrace;
       }
-    }
-
-    // Pass 2: write merged zip.
-    try (ZipOutputStream zout = new ZipOutputStream(Files.newOutputStream(output))) {
-      writeZipEntry(zout, "trace.json", traceLines);
-      writeZipEntry(zout, "network.json", networkLines);
-
-      // Re-stream resource files.
-      for (Path chunk : chunks) {
-        if (!Files.exists(chunk)) continue;
-        try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(chunk))) {
-          ZipEntry entry;
-          while ((entry = zin.getNextEntry()) != null) {
-            String name = entry.getName();
-            byte[] data = zin.readAllBytes();
-            if (name.startsWith("resources/") && resourcesSeen.remove(name)) {
-              zout.putNextEntry(new ZipEntry(name));
-              zout.write(data);
-              zout.closeEntry();
-            }
-            zin.closeEntry();
-          }
-        }
-      }
+    } catch (IOException e) {
+      return false;
     }
   }
 
-  private static void writeZipEntry(ZipOutputStream zout, String name, List<byte[]> lines)
-      throws IOException {
-    zout.putNextEntry(new ZipEntry(name));
-    for (byte[] line : lines) zout.write(line);
-    zout.closeEntry();
+  private static boolean isTraceEntry(String name) {
+    return "trace.json".equals(name) || "trace.trace".equals(name);
+  }
+
+  private static void moveAtomically(Path source, Path target) throws IOException {
+    try {
+      Files.move(
+          source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+    } catch (AtomicMoveNotSupportedException e) {
+      Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+    }
+  }
+
+  private static void deleteRecursively(Path dir) {
+    if (!Files.exists(dir)) {
+      return;
+    }
+    try (var paths = Files.walk(dir)) {
+      paths
+          .sorted(Comparator.reverseOrder())
+          .forEach(
+              path -> {
+                try {
+                  Files.deleteIfExists(path);
+                } catch (IOException ignored) {
+                }
+              });
+    } catch (IOException ignored) {
+    }
   }
 
   // ---- Playwright helpers (run on playwrightThread) ------------------------
 
-  private void safeGroup(SessionTraceContext ctx, String label) {
+  private void safeGroupClose(SessionTraceContext ctx, BrowserContext context) {
     try {
-      ctx.context().tracing().group(label);
-    } catch (Exception e) {
-      LOG.log(Level.FINE, "tracing.group failed for " + ctx.sessionId(), e);
-    }
-  }
-
-  private void safeGroupClose(SessionTraceContext ctx) {
-    try {
-      ctx.context().tracing().groupEnd();
+      context.tracing().groupEnd();
     } catch (Exception e) {
       LOG.log(Level.FINE, "tracing.groupEnd failed for " + ctx.sessionId(), e);
     }
@@ -619,15 +654,234 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
    * snapshot immediately before and after it runs — this is what the {@code trace.playwright.dev}
    * viewer shows as the "DOM preview" for an action.
    */
-  private void safeDomSnapshot(SessionTraceContext ctx) {
+  private void safeDomSnapshot(SessionTraceContext ctx, BrowserContext context) {
     try {
-      List<Page> pages = ctx.context().pages();
+      List<Page> pages = context.pages();
       if (!pages.isEmpty()) {
         pages.get(0).evaluate("1");
       }
     } catch (Exception e) {
       LOG.log(Level.FINE, "DOM snapshot failed for " + ctx.sessionId(), e);
     }
+  }
+
+  private void cachePendingVerification(
+      SessionId sessionId,
+      SessionTraceContext ctx,
+      HttpRequest req,
+      HttpResponse response,
+      String selector) {
+    VerificationCheckpoint checkpoint = verificationCheckpoint(ctx, req, response, selector);
+    if (checkpoint == null
+        || !ctx.shouldRecordVerificationState(checkpoint.key(), checkpoint.state())) {
+      return;
+    }
+    try {
+      playwrightThread
+          .submit(
+              () -> {
+                if (startCommandTrace(sessionId, ctx, checkpoint.label())) {
+                  finishCommandTrace(sessionId, ctx);
+                }
+              })
+          .get(15, TimeUnit.SECONDS);
+    } catch (Exception e) {
+      LOG.log(Level.FINE, "Verification trace failed for session " + sessionId, e);
+    }
+  }
+
+  static String verificationLabel(
+      SessionTraceContext ctx, HttpRequest req, HttpResponse response, String selector) {
+    VerificationCheckpoint checkpoint = verificationCheckpoint(ctx, req, response, selector);
+    return checkpoint == null ? null : checkpoint.label();
+  }
+
+  private static VerificationCheckpoint verificationCheckpoint(
+      SessionTraceContext ctx, HttpRequest req, HttpResponse response, String selector) {
+    String path = strippedPath(req.getUri());
+    if (isFindElement(req)) {
+      String readableSelector = formatSelector(selector);
+      if (readableSelector == null) {
+        return null;
+      }
+
+      String body = responseBody(response);
+      if (response.isSuccessful()) {
+        String elementId = extractElementId(body);
+        ctx.rememberElementSelector(elementId, selector);
+        if (isFindElementsPath(path)) {
+          if (isEmptyElementList(body)) {
+            return verification(
+                "elements:" + readableSelector,
+                "absent",
+                "Verify elements absent \u2014 " + readableSelector);
+          }
+          return verification(
+              "elements:" + readableSelector,
+              "present",
+              "Verify elements present \u2014 " + readableSelector);
+        }
+        return verification(
+            "element:" + readableSelector,
+            "present",
+            "Verify element present \u2014 " + readableSelector);
+      }
+
+      if (response.getStatus() == 404) {
+        return verification(
+            "element:" + readableSelector,
+            "absent",
+            "Verify element absent \u2014 " + readableSelector);
+      }
+      return null;
+    }
+
+    if ("/execute/sync".equals(path) && isSeleniumAtomScript(req)) {
+      return seleniumAtomVerificationLabel(ctx, req, response);
+    }
+
+    if (!"GET".equals(req.getMethod().toString())) {
+      return null;
+    }
+
+    String elementId = elementIdFromPath(path);
+    String readableSelector = formatSelector(ctx.selectorForElement(elementId));
+    if (readableSelector == null) {
+      readableSelector = formatSelector(ctx.peekLastSelector());
+    }
+    if (readableSelector == null) {
+      return null;
+    }
+
+    if (PAT_ELEM_DISPLAYED.matcher(path).matches()) {
+      Boolean displayed = extractJsonBoolean(responseBody(response), "value");
+      if (displayed == null) {
+        return null;
+      }
+      return verification(
+          "visibility:" + readableSelector,
+          displayed ? "visible" : "hidden",
+          (displayed ? "Verify visible \u2014 " : "Verify hidden \u2014 ") + readableSelector);
+    }
+
+    if (PAT_ELEM_ENABLED.matcher(path).matches()) {
+      Boolean enabled = extractJsonBoolean(responseBody(response), "value");
+      if (enabled == null) {
+        return null;
+      }
+      return verification(
+          "enabled:" + readableSelector,
+          enabled ? "enabled" : "disabled",
+          (enabled ? "Verify enabled \u2014 " : "Verify disabled \u2014 ") + readableSelector);
+    }
+
+    if (PAT_ELEM_SELECTED.matcher(path).matches()) {
+      Boolean selected = extractJsonBoolean(responseBody(response), "value");
+      if (selected == null) {
+        return null;
+      }
+      return verification(
+          "selected:" + readableSelector,
+          selected ? "selected" : "not-selected",
+          (selected ? "Verify selected \u2014 " : "Verify not selected \u2014 ")
+              + readableSelector);
+    }
+
+    return null;
+  }
+
+  private static VerificationCheckpoint seleniumAtomVerificationLabel(
+      SessionTraceContext ctx, HttpRequest req, HttpResponse response) {
+    String body = readBody(req);
+    if (body == null) {
+      return null;
+    }
+    String script = extractJsonField(body, "script");
+    if (script == null || !script.stripLeading().startsWith("/* isDisplayed */")) {
+      return null;
+    }
+
+    String readableSelector = formatSelector(ctx.selectorForElement(extractElementId(body)));
+    if (readableSelector == null) {
+      readableSelector = formatSelector(ctx.peekLastSelector());
+    }
+    if (readableSelector == null) {
+      return null;
+    }
+
+    Boolean displayed = extractJsonBoolean(responseBody(response), "value");
+    if (displayed == null) {
+      return null;
+    }
+    return verification(
+        "visibility:" + readableSelector,
+        displayed ? "visible" : "hidden",
+        (displayed ? "Verify visible \u2014 " : "Verify hidden \u2014 ") + readableSelector);
+  }
+
+  private static VerificationCheckpoint verification(String key, String state, String label) {
+    return new VerificationCheckpoint(key, state, label);
+  }
+
+  private record VerificationCheckpoint(String key, String state, String label) {}
+
+  private static String responseBody(HttpResponse response) {
+    try {
+      return response.contentAsString();
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  private static String extractElementId(String json) {
+    if (json == null) {
+      return null;
+    }
+    String elementId = extractJsonField(json, "element-6066-11e4-a52e-4f735466cecf");
+    return elementId != null ? elementId : extractJsonField(json, "ELEMENT");
+  }
+
+  private static boolean isEmptyElementList(String json) {
+    if (json == null) {
+      return false;
+    }
+    return json.replaceAll("\\s+", "").contains("\"value\":[]");
+  }
+
+  private static Boolean extractJsonBoolean(String json, String key) {
+    if (json == null) {
+      return null;
+    }
+    String needle = "\"" + key + "\"";
+    int idx = json.indexOf(needle);
+    if (idx < 0) {
+      return null;
+    }
+    idx += needle.length();
+    while (idx < json.length() && (json.charAt(idx) == ' ' || json.charAt(idx) == ':')) {
+      idx++;
+    }
+    if (json.startsWith("true", idx)) {
+      return true;
+    }
+    if (json.startsWith("false", idx)) {
+      return false;
+    }
+    return null;
+  }
+
+  private static String elementIdFromPath(String path) {
+    String prefix = "/element/";
+    if (!path.startsWith(prefix)) {
+      return null;
+    }
+    int start = prefix.length();
+    int end = path.indexOf('/', start);
+    return end > start ? path.substring(start, end) : null;
+  }
+
+  private static boolean isFindElementsPath(String path) {
+    return "/elements".equals(path) || path.endsWith("/elements");
   }
 
   private void closePlaywright() {
@@ -808,7 +1062,10 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     String base = actionLabel(req);
     String path = strippedPath(req.getUri());
     if (PAT_ELEM_INTERACT.matcher(path).matches()) {
-      String sel = formatSelector(ctx.consumeLastSelector());
+      String sel = formatSelector(ctx.selectorForElement(elementIdFromPath(path)));
+      if (sel == null) {
+        sel = formatSelector(ctx.consumeLastSelector());
+      }
       if (sel != null) {
         // If the base label already contains detail (em dash), append selector in parens.
         // Otherwise use em dash so the format is consistent with other labels.

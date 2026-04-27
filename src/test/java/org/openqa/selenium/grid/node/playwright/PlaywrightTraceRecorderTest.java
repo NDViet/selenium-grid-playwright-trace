@@ -2,10 +2,12 @@ package org.openqa.selenium.grid.node.playwright;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import java.nio.file.Path;
 import org.junit.jupiter.api.Test;
 import org.openqa.selenium.remote.http.Contents;
 import org.openqa.selenium.remote.http.HttpMethod;
 import org.openqa.selenium.remote.http.HttpRequest;
+import org.openqa.selenium.remote.http.HttpResponse;
 
 class PlaywrightTraceRecorderTest {
 
@@ -113,6 +115,91 @@ class PlaywrightTraceRecorderTest {
   void actionLabel_fallsBackToRawLabelForUnknownCommand() {
     HttpRequest req = new HttpRequest(HttpMethod.GET, "/session/s1/some/unknown/path");
     assertThat(PlaywrightTraceRecorder.actionLabel(req)).isEqualTo("GET /some/unknown/path");
+  }
+
+  @Test
+  void traceFileName_usesSanitizedSessionNameAndSessionId() {
+    assertThat(PlaywrightTraceRecorder.traceFileName("My Test Case: waits!", "abc123"))
+        .isEqualTo("trace_my-test-case-waits_abc123.zip");
+  }
+
+  @Test
+  void traceFileName_fallsBackToSessionIdWhenNameMissing() {
+    assertThat(PlaywrightTraceRecorder.traceFileName(null, "abc123")).isEqualTo("trace_abc123.zip");
+  }
+
+  // ---- verificationLabel --------------------------------------------------
+
+  @Test
+  void verificationLabel_findElementPresentRemembersSelector() {
+    SessionTraceContext ctx = context();
+    HttpRequest req =
+        post("/session/s1/element", "{\"using\":\"css selector\",\"value\":\"#toast\"}");
+    HttpResponse response =
+        response(
+            200,
+            "{\"value\":{\"element-6066-11e4-a52e-4f735466cecf\":\"elem-1\","
+                + "\"ELEMENT\":\"elem-1\"}}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(ctx, req, response, "css selector: #toast"))
+        .isEqualTo("Verify element present \u2014 #toast");
+    assertThat(ctx.selectorForElement("elem-1")).isEqualTo("css selector: #toast");
+  }
+
+  @Test
+  void verificationLabel_displayedTrueUsesRememberedSelector() {
+    SessionTraceContext ctx = context();
+    ctx.rememberElementSelector("elem-1", "css selector: #toast");
+    HttpRequest req = new HttpRequest(HttpMethod.GET, "/session/s1/element/elem-1/displayed");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx, req, response(200, "{\"value\":true}"), null))
+        .isEqualTo("Verify visible \u2014 #toast");
+  }
+
+  @Test
+  void verificationLabel_namedIsDisplayedAtomUsesRememberedSelector() {
+    SessionTraceContext ctx = context();
+    ctx.rememberElementSelector("elem-1", "xpath: //p[text()='Done']");
+    HttpRequest req =
+        post(
+            "/session/s1/execute/sync",
+            "{\"script\":\"/* isDisplayed */return (function(){return true;})()\","
+                + "\"args\":[{\"element-6066-11e4-a52e-4f735466cecf\":\"elem-1\"}]}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx, req, response(200, "{\"value\":true}"), null))
+        .isEqualTo("Verify visible \u2014 xpath: //p[text()='Done']");
+  }
+
+  @Test
+  void verificationLabel_findElementNotFoundIsAbsent() {
+    SessionTraceContext ctx = context();
+    HttpRequest req =
+        post("/session/s1/element", "{\"using\":\"xpath\",\"value\":\"//p[text()='Done']\"}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx,
+                req,
+                response(404, "{\"value\":{\"error\":\"no such element\"}}"),
+                "xpath: //p[text()='Done']"))
+        .isEqualTo("Verify element absent \u2014 xpath: //p[text()='Done']");
+  }
+
+  @Test
+  void verificationLabel_emptyFindElementsIsAbsent() {
+    SessionTraceContext ctx = context();
+    HttpRequest req =
+        post("/session/s1/elements", "{\"using\":\"css selector\",\"value\":\".toast\"}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx, req, response(200, "{\"value\":[]}"), "css selector: .toast"))
+        .isEqualTo("Verify elements absent \u2014 .toast");
   }
 
   // ---- isSeleniumAtomScript ------------------------------------------------
@@ -231,5 +318,17 @@ class PlaywrightTraceRecorderTest {
     HttpRequest req = new HttpRequest(HttpMethod.POST, uri);
     req.setContent(Contents.utf8String(body));
     return req;
+  }
+
+  private static HttpResponse response(int status, String body) {
+    HttpResponse response = new HttpResponse();
+    response.setStatus(status);
+    response.setContent(Contents.utf8String(body));
+    return response;
+  }
+
+  private static SessionTraceContext context() {
+    return new SessionTraceContext(
+        Path.of("trace"), "ws://localhost/session/s1/se/cdp", "s1", "trace_s1.zip");
   }
 }
