@@ -24,6 +24,8 @@ class SessionTraceContext {
   private String lastSelector;
   private final Map<String, String> elementSelectors = new HashMap<>();
   private final Map<String, String> verificationStates = new LinkedHashMap<>();
+  private int documentReadyBoundary;
+  private int recordedDocumentReadyBoundary;
 
   SessionTraceContext(Path traceDir, String cdpUrl, String sessionId, String traceName) {
     this.traceDir = traceDir;
@@ -102,6 +104,18 @@ class SessionTraceContext {
 
   synchronized String selectorForElement(String elementId) {
     return elementId == null ? null : elementSelectors.get(elementId);
+  }
+
+  synchronized void markDocumentReadyBoundary() {
+    documentReadyBoundary++;
+  }
+
+  synchronized String consumeDocumentReadyCheckpointKey() {
+    if (documentReadyBoundary == recordedDocumentReadyBoundary) {
+      return null;
+    }
+    recordedDocumentReadyBoundary = documentReadyBoundary;
+    return "document-ready:" + documentReadyBoundary;
   }
 
   synchronized boolean shouldRecordVerificationState(String key, String state) {

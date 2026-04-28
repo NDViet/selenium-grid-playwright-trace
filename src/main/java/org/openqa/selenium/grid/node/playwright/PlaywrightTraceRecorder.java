@@ -439,6 +439,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         ctx.setTracingStarted(true);
       }
       ctx.context().tracing().group(label);
+      if (isDocumentReadyBoundary(label)) {
+        ctx.markDocumentReadyBoundary();
+      }
       return true;
     } catch (Exception e) {
       LOG.log(
@@ -673,8 +676,7 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       String selector) {
     VerificationCheckpoint checkpoint = verificationCheckpoint(ctx, req, response, selector);
     if (checkpoint == null
-        || (!checkpoint.alwaysRecord()
-            && !ctx.shouldRecordVerificationState(checkpoint.key(), checkpoint.state()))) {
+        || !ctx.shouldRecordVerificationState(checkpoint.key(), checkpoint.state())) {
       return;
     }
     try {
@@ -738,114 +740,36 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     }
 
     if ("/execute/sync".equals(path) && isDocumentReadyStateProbe(req)) {
-      return documentReadyVerificationLabel(req, response);
-    }
-
-    if ("/execute/sync".equals(path) && isSeleniumAtomScript(req)) {
-      return seleniumAtomVerificationLabel(ctx, req, response);
+      return documentReadyVerificationLabel(ctx, req, response);
     }
 
     if (!"GET".equals(req.getMethod().toString())) {
       return null;
     }
 
-    String elementId = elementIdFromPath(path);
-    String readableSelector = formatSelector(ctx.selectorForElement(elementId));
-    if (readableSelector == null) {
-      readableSelector = formatSelector(ctx.peekLastSelector());
-    }
-    if (readableSelector == null) {
-      return null;
-    }
-
-    if (PAT_ELEM_DISPLAYED.matcher(path).matches()) {
-      Boolean displayed = extractJsonBoolean(responseBody(response), "value");
-      if (displayed == null) {
-        return null;
-      }
-      return verification(
-          "visibility:" + readableSelector,
-          displayed ? "visible" : "hidden",
-          (displayed ? "Verify visible \u2014 " : "Verify hidden \u2014 ") + readableSelector);
-    }
-
-    if (PAT_ELEM_ENABLED.matcher(path).matches()) {
-      Boolean enabled = extractJsonBoolean(responseBody(response), "value");
-      if (enabled == null) {
-        return null;
-      }
-      return verification(
-          "enabled:" + readableSelector,
-          enabled ? "enabled" : "disabled",
-          (enabled ? "Verify enabled \u2014 " : "Verify disabled \u2014 ") + readableSelector);
-    }
-
-    if (PAT_ELEM_SELECTED.matcher(path).matches()) {
-      Boolean selected = extractJsonBoolean(responseBody(response), "value");
-      if (selected == null) {
-        return null;
-      }
-      return verification(
-          "selected:" + readableSelector,
-          selected ? "selected" : "not-selected",
-          (selected ? "Verify selected \u2014 " : "Verify not selected \u2014 ")
-              + readableSelector);
-    }
-
     return null;
   }
 
-  private static VerificationCheckpoint seleniumAtomVerificationLabel(
-      SessionTraceContext ctx, HttpRequest req, HttpResponse response) {
-    String body = readBody(req);
-    if (body == null) {
-      return null;
-    }
-    String script = extractJsonField(body, "script");
-    if (script == null || !script.stripLeading().startsWith("/* isDisplayed */")) {
-      return null;
-    }
-
-    String readableSelector = formatSelector(ctx.selectorForElement(extractElementId(body)));
-    if (readableSelector == null) {
-      readableSelector = formatSelector(ctx.peekLastSelector());
-    }
-    if (readableSelector == null) {
-      return null;
-    }
-
-    Boolean displayed = extractJsonBoolean(responseBody(response), "value");
-    if (displayed == null) {
-      return null;
-    }
-    return verification(
-        "visibility:" + readableSelector,
-        displayed ? "visible" : "hidden",
-        (displayed ? "Verify visible \u2014 " : "Verify hidden \u2014 ") + readableSelector);
-  }
-
   private static VerificationCheckpoint documentReadyVerificationLabel(
-      HttpRequest req, HttpResponse response) {
+      SessionTraceContext ctx, HttpRequest req, HttpResponse response) {
     if (!response.isSuccessful() || !isDocumentReadyStateProbe(req)) {
       return null;
     }
     if (!"complete".equals(extractJsonField(responseBody(response), "value"))) {
       return null;
     }
-    return alwaysRecordVerification("document-ready", "complete", "Page ready");
+    String key = ctx.consumeDocumentReadyCheckpointKey();
+    if (key == null) {
+      return null;
+    }
+    return verification(key, "complete", "Page ready");
   }
 
   private static VerificationCheckpoint verification(String key, String state, String label) {
-    return new VerificationCheckpoint(key, state, label, false);
+    return new VerificationCheckpoint(key, state, label);
   }
 
-  private static VerificationCheckpoint alwaysRecordVerification(
-      String key, String state, String label) {
-    return new VerificationCheckpoint(key, state, label, true);
-  }
-
-  private record VerificationCheckpoint(
-      String key, String state, String label, boolean alwaysRecord) {}
+  private record VerificationCheckpoint(String key, String state, String label) {}
 
   private static String responseBody(HttpResponse response) {
     try {
@@ -868,28 +792,6 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       return false;
     }
     return json.replaceAll("\\s+", "").contains("\"value\":[]");
-  }
-
-  private static Boolean extractJsonBoolean(String json, String key) {
-    if (json == null) {
-      return null;
-    }
-    String needle = "\"" + key + "\"";
-    int idx = json.indexOf(needle);
-    if (idx < 0) {
-      return null;
-    }
-    idx += needle.length();
-    while (idx < json.length() && (json.charAt(idx) == ' ' || json.charAt(idx) == ':')) {
-      idx++;
-    }
-    if (json.startsWith("true", idx)) {
-      return true;
-    }
-    if (json.startsWith("false", idx)) {
-      return false;
-    }
-    return null;
   }
 
   private static String elementIdFromPath(String path) {
@@ -1146,6 +1048,17 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
     String selector =
         raw.startsWith("css selector: ") ? raw.substring("css selector: ".length()) : raw;
     return selector.replace("\\-", "-");
+  }
+
+  private static boolean isDocumentReadyBoundary(String label) {
+    return label.startsWith("Navigate")
+        || label.startsWith("Back")
+        || label.startsWith("Forward")
+        || label.startsWith("Refresh")
+        || label.startsWith("SwitchFrame")
+        || label.startsWith("SwitchParentFrame")
+        || label.startsWith("SwitchWindow")
+        || label.startsWith("NewWindow");
   }
 
   // ---- Action label construction -------------------------------------------

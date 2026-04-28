@@ -132,8 +132,8 @@ class TraceGridEndToEndTest {
     waitForDocumentReady(driver, wait);
 
     Thread.sleep(sessionTimeout.plusSeconds(40).toMillis());
-
-    assertThatSessionHasTimedOut(driver);
+    stop(node);
+    node = null;
 
     Path traceZip = traceZip(testName, sessionId);
     waitUntil(

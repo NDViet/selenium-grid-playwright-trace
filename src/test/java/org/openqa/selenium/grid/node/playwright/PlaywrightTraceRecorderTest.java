@@ -148,7 +148,7 @@ class PlaywrightTraceRecorderTest {
   }
 
   @Test
-  void verificationLabel_displayedTrueUsesRememberedSelector() {
+  void verificationLabel_displayedTrueIsNotTraced() {
     SessionTraceContext ctx = context();
     ctx.rememberElementSelector("elem-1", "css selector: #toast");
     HttpRequest req = new HttpRequest(HttpMethod.GET, "/session/s1/element/elem-1/displayed");
@@ -156,11 +156,11 @@ class PlaywrightTraceRecorderTest {
     assertThat(
             PlaywrightTraceRecorder.verificationLabel(
                 ctx, req, response(200, "{\"value\":true}"), null))
-        .isEqualTo("Verify visible \u2014 #toast");
+        .isNull();
   }
 
   @Test
-  void verificationLabel_namedIsDisplayedAtomUsesRememberedSelector() {
+  void verificationLabel_namedIsDisplayedAtomIsNotTraced() {
     SessionTraceContext ctx = context();
     ctx.rememberElementSelector("elem-1", "xpath: //p[text()='Done']");
     HttpRequest req =
@@ -172,7 +172,7 @@ class PlaywrightTraceRecorderTest {
     assertThat(
             PlaywrightTraceRecorder.verificationLabel(
                 ctx, req, response(200, "{\"value\":true}"), null))
-        .isEqualTo("Verify visible \u2014 xpath: //p[text()='Done']");
+        .isNull();
   }
 
   @Test
@@ -204,13 +204,32 @@ class PlaywrightTraceRecorderTest {
 
   @Test
   void verificationLabel_documentReadyStateCompleteIsPageReady() {
+    SessionTraceContext ctx = context();
+    ctx.markDocumentReadyBoundary();
     HttpRequest req =
         post("/session/s1/execute/sync", "{\"script\":\"return document.readyState\",\"args\":[]}");
 
     assertThat(
             PlaywrightTraceRecorder.verificationLabel(
-                context(), req, response(200, "{\"value\":\"complete\"}"), null))
+                ctx, req, response(200, "{\"value\":\"complete\"}"), null))
         .isEqualTo("Page ready");
+  }
+
+  @Test
+  void verificationLabel_documentReadyStateCompleteRecordsOncePerBoundary() {
+    SessionTraceContext ctx = context();
+    ctx.markDocumentReadyBoundary();
+    HttpRequest req =
+        post("/session/s1/execute/sync", "{\"script\":\"return document.readyState\",\"args\":[]}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx, req, response(200, "{\"value\":\"complete\"}"), null))
+        .isEqualTo("Page ready");
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                ctx, req, response(200, "{\"value\":\"complete\"}"), null))
+        .isNull();
   }
 
   // ---- isSeleniumAtomScript ------------------------------------------------
