@@ -173,6 +173,98 @@ class TraceGridEndToEndTest {
     System.out.println("Grid logs: " + logsDir);
   }
 
+  @Test
+  void recordsActionsAndDomSnapshotsForNavigationAndTitleOnly(TestInfo testInfo) throws Exception {
+    assertThat(Files.isRegularFile(seleniumServerJar)).isTrue();
+    assertThat(Files.isRegularFile(extensionJar)).isTrue();
+
+    URI gridUrl = startGrid(Duration.ofSeconds(30));
+
+    String testName = testName(testInfo);
+    RemoteWebDriver driver = createSession(gridUrl, testName);
+    String sessionId = driver.getSessionId().toString();
+    try {
+      driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(15));
+      driver.get("https://google.com");
+      assertThat(driver.getTitle()).isNotBlank();
+    } finally {
+      driver.quit();
+    }
+
+    Path traceZip = traceZip(testName, sessionId);
+    waitUntil(
+        "title-only trace zip exists",
+        Duration.ofSeconds(30),
+        () -> Files.isRegularFile(traceZip) && traceZip.toFile().length() > 0);
+    assertTitleOnlyTraceZip(traceZip);
+
+    System.out.println("Title-only trace output: " + traceZip);
+    System.out.println("Grid logs: " + logsDir);
+  }
+
+  @Test
+  void recordsNavigateActionForNavigationOnly(TestInfo testInfo) throws Exception {
+    assertThat(Files.isRegularFile(seleniumServerJar)).isTrue();
+    assertThat(Files.isRegularFile(extensionJar)).isTrue();
+
+    URI gridUrl = startGrid(Duration.ofSeconds(30));
+
+    String testName = testName(testInfo);
+    RemoteWebDriver driver = createSession(gridUrl, testName, PageLoadStrategy.NORMAL);
+    String sessionId = driver.getSessionId().toString();
+    try {
+      driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
+      driver.get("https://google.com");
+    } finally {
+      driver.quit();
+    }
+
+    Path traceZip = traceZip(testName, sessionId);
+    waitUntil(
+        "navigation-only trace zip exists",
+        Duration.ofSeconds(30),
+        () -> Files.isRegularFile(traceZip) && traceZip.toFile().length() > 0);
+    assertTraceContainsAction(traceZip, "Navigate");
+
+    System.out.println("Navigation-only trace output: " + traceZip);
+    System.out.println("Grid logs: " + logsDir);
+  }
+
+  @Test
+  void recordsFrameSwitchActionForIframeById(TestInfo testInfo) throws Exception {
+    assertThat(Files.isRegularFile(seleniumServerJar)).isTrue();
+    assertThat(Files.isRegularFile(extensionJar)).isTrue();
+
+    URI gridUrl = startGrid(Duration.ofSeconds(30));
+
+    String testName = testName(testInfo);
+    RemoteWebDriver driver = createSession(gridUrl, testName);
+    String sessionId = driver.getSessionId().toString();
+    try {
+      driver.manage().timeouts().pageLoadTimeout(Duration.ofSeconds(30));
+      driver.get("https://practice-automation.com/iframes/");
+      WebDriverWait wait = new WebDriverWait(driver, Duration.ofSeconds(20));
+      waitForDocumentReady(driver, wait);
+      WebElement iframe =
+          wait.until(ExpectedConditions.presenceOfElementLocated(By.id("iframe-2")));
+      driver.switchTo().frame(iframe);
+      waitForDocumentComplete(driver, wait);
+    } finally {
+      driver.quit();
+    }
+
+    Path traceZip = traceZip(testName, sessionId);
+    waitUntil(
+        "iframe trace zip exists",
+        Duration.ofSeconds(30),
+        () -> Files.isRegularFile(traceZip) && traceZip.toFile().length() > 0);
+    assertTraceContains(traceZip, "SwitchFrame", "#iframe-2", "Page ready");
+    assertTraceDoesNotContain(traceZip, "ExecuteScript \u2014 return document.readyState");
+
+    System.out.println("Iframe trace output: " + traceZip);
+    System.out.println("Grid logs: " + logsDir);
+  }
+
   private URI startGrid(Duration sessionTimeout) throws IOException, InterruptedException {
     int hubPort = freePort();
     int nodePort = freePort();
@@ -228,6 +320,11 @@ class TraceGridEndToEndTest {
   }
 
   private RemoteWebDriver createSession(URI gridUrl, String testName) throws InterruptedException {
+    return createSession(gridUrl, testName, PageLoadStrategy.EAGER);
+  }
+
+  private RemoteWebDriver createSession(
+      URI gridUrl, String testName, PageLoadStrategy pageLoadStrategy) throws InterruptedException {
     ChromeOptions options = new ChromeOptions();
     options.addArguments(
         "--headless=new",
@@ -235,7 +332,7 @@ class TraceGridEndToEndTest {
         "--no-sandbox",
         "--window-size=1440,1000",
         "--disable-notifications");
-    options.setPageLoadStrategy(PageLoadStrategy.EAGER);
+    options.setPageLoadStrategy(pageLoadStrategy);
     options.setCapability(PlaywrightTraceRecorder.CAP_RECORD_TRACE, true);
     options.setCapability(PlaywrightTraceRecorder.CAP_SESSION_NAME, testName);
 
@@ -458,6 +555,10 @@ class TraceGridEndToEndTest {
         });
   }
 
+  private void waitForDocumentComplete(RemoteWebDriver driver, WebDriverWait wait) {
+    wait.until(ignored -> "complete".equals(executeString(driver, "return document.readyState")));
+  }
+
   private void assertThatSessionHasTimedOut(RemoteWebDriver driver) {
     try {
       driver.getTitle();
@@ -565,6 +666,50 @@ class TraceGridEndToEndTest {
     assertThat(hasSnapshotProbeActions)
         .as("snapshot probe actions present in " + traceZip)
         .isTrue();
+  }
+
+  private void assertTitleOnlyTraceZip(Path traceZip) throws IOException {
+    String trace = tracePayload(traceZip);
+    assertThat(trace).as("trace payload present in " + traceZip).isNotBlank();
+    assertThat(trace).as("WebDriver trace groups present in " + traceZip).contains("tracingGroup");
+    assertThat(trace).as("title action present in " + traceZip).contains("GetTitle");
+    assertThat(trace).as("DOM snapshots present in " + traceZip).contains("frame-snapshot");
+    assertThat(trace)
+        .as("snapshot probe actions present in " + traceZip)
+        .contains("evaluateExpression");
+  }
+
+  private void assertTraceContainsAction(Path traceZip, String action) throws IOException {
+    assertTraceContains(traceZip, action);
+  }
+
+  private void assertTraceContains(Path traceZip, String... expectedValues) throws IOException {
+    String trace = tracePayload(traceZip);
+    assertThat(trace).as("trace payload present in " + traceZip).isNotBlank();
+    assertThat(trace).as("WebDriver trace groups present in " + traceZip).contains("tracingGroup");
+    for (String expectedValue : expectedValues) {
+      assertThat(trace).as(expectedValue + " present in " + traceZip).contains(expectedValue);
+    }
+  }
+
+  private void assertTraceDoesNotContain(Path traceZip, String unexpectedValue) throws IOException {
+    String trace = tracePayload(traceZip);
+    assertThat(trace)
+        .as(unexpectedValue + " absent in " + traceZip)
+        .doesNotContain(unexpectedValue);
+  }
+
+  private static String tracePayload(Path traceZip) throws IOException {
+    try (ZipInputStream zin = new ZipInputStream(Files.newInputStream(traceZip))) {
+      ZipEntry entry;
+      while ((entry = zin.getNextEntry()) != null) {
+        if ("trace.json".equals(entry.getName()) || "trace.trace".equals(entry.getName())) {
+          return new String(zin.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        zin.closeEntry();
+      }
+    }
+    return "";
   }
 
   private static void waitUntil(String label, Duration timeout, BooleanSupplier condition)

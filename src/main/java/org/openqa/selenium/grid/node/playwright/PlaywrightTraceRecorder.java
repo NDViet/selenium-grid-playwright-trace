@@ -673,7 +673,8 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       String selector) {
     VerificationCheckpoint checkpoint = verificationCheckpoint(ctx, req, response, selector);
     if (checkpoint == null
-        || !ctx.shouldRecordVerificationState(checkpoint.key(), checkpoint.state())) {
+        || (!checkpoint.alwaysRecord()
+            && !ctx.shouldRecordVerificationState(checkpoint.key(), checkpoint.state()))) {
       return;
     }
     try {
@@ -734,6 +735,10 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
             "Verify element absent \u2014 " + readableSelector);
       }
       return null;
+    }
+
+    if ("/execute/sync".equals(path) && isDocumentReadyStateProbe(req)) {
+      return documentReadyVerificationLabel(req, response);
     }
 
     if ("/execute/sync".equals(path) && isSeleniumAtomScript(req)) {
@@ -819,11 +824,28 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         (displayed ? "Verify visible \u2014 " : "Verify hidden \u2014 ") + readableSelector);
   }
 
-  private static VerificationCheckpoint verification(String key, String state, String label) {
-    return new VerificationCheckpoint(key, state, label);
+  private static VerificationCheckpoint documentReadyVerificationLabel(
+      HttpRequest req, HttpResponse response) {
+    if (!response.isSuccessful() || !isDocumentReadyStateProbe(req)) {
+      return null;
+    }
+    if (!"complete".equals(extractJsonField(responseBody(response), "value"))) {
+      return null;
+    }
+    return alwaysRecordVerification("document-ready", "complete", "Page ready");
   }
 
-  private record VerificationCheckpoint(String key, String state, String label) {}
+  private static VerificationCheckpoint verification(String key, String state, String label) {
+    return new VerificationCheckpoint(key, state, label, false);
+  }
+
+  private static VerificationCheckpoint alwaysRecordVerification(
+      String key, String state, String label) {
+    return new VerificationCheckpoint(key, state, label, true);
+  }
+
+  private record VerificationCheckpoint(
+      String key, String state, String label, boolean alwaysRecord) {}
 
   private static String responseBody(HttpResponse response) {
     try {
@@ -907,10 +929,10 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
    *         <li>Raw: {@code return (function(){var ...})()}
    *         <li>Named: {@code /* isDisplayed *}{@code /return (function(){...})()}
    *       </ul>
-   *   <li><b>Viewport / geometry probes</b> — single-line {@code return <expr>} scripts that test
-   *       frameworks (Selenide, Actions helpers, custom utilities) inject repetitively before
-   *       interactions to read scroll positions, viewport dimensions, or element offsets. They
-   *       carry no user intent and produce nothing but timeline noise.
+   *   <li><b>Read-only probes</b> — single-line scripts that test frameworks or explicit waits
+   *       inject repetitively before interactions to read document readiness, scroll positions,
+   *       viewport dimensions, or element offsets. They carry no user intent and produce nothing
+   *       but timeline noise.
    * </ol>
    */
   static boolean isSeleniumAtomScript(HttpRequest req) {
@@ -933,6 +955,8 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
       // Common one-liner internal helpers
       if (t.startsWith("arguments[0].scrollIntoView")) return true;
       if (t.startsWith("arguments[0].click()")) return true;
+      // Polling for page/frame readiness is wait infrastructure, not a user action.
+      if (isDocumentReadyStateProbeScript(t)) return true;
       // Viewport/geometry probes injected by test frameworks before interactions.
       if (isViewportProbeScript(t)) return true;
       return false;
@@ -977,6 +1001,20 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         || expr.startsWith("document.body.scrollLeft");
   }
 
+  private static boolean isDocumentReadyStateProbeScript(String script) {
+    String normalized = script.strip().replaceAll("\\s+", " ");
+    return "return document.readyState".equals(normalized)
+        || "return window.document.readyState".equals(normalized);
+  }
+
+  private static boolean isDocumentReadyStateProbe(HttpRequest req) {
+    if (!"/execute/sync".equals(strippedPath(req.getUri()))) return false;
+    String body = readBody(req);
+    if (body == null) return false;
+    String script = extractJsonField(body, "script");
+    return script != null && isDocumentReadyStateProbeScript(script);
+  }
+
   /**
    * Returns {@code true} if this request is the DELETE /session/{id} command that quits the
    * browser. We use this to stop the trace synchronously before the browser is closed.
@@ -1000,13 +1038,13 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
 
   /**
    * Returns {@code true} for commands that represent a meaningful user action worth recording in
-   * the trace: navigation, element interactions, script execution, alert handling, and frame/window
-   * management.
+   * the trace: navigation, element interactions, script execution, alert handling, frame/window
+   * management, and explicit title reads.
    *
    * <p>Excluded (no trace group created):
    *
    * <ul>
-   *   <li>All GET read-only probes (getAttribute, getText, isDisplayed, title, url, …)
+   *   <li>Most GET read-only probes (getAttribute, getText, isDisplayed, url, …)
    *   <li>findElement / findElements (handled separately by {@link #isFindElement})
    *   <li>execute/async — almost exclusively framework-internal wait scripts (Angular sync,
    *       page-load strategies, FluentWait); produces nothing but noise in the trace timeline
@@ -1016,8 +1054,11 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
    */
   private static boolean shouldTrace(HttpRequest req) {
     String method = req.getMethod().toString();
-    if (!"POST".equals(method) && !"DELETE".equals(method)) return false;
     String path = strippedPath(req.getUri());
+    if ("GET".equals(method)) {
+      return "/title".equals(path);
+    }
+    if (!"POST".equals(method) && !"DELETE".equals(method)) return false;
     switch (path) {
       case "/url": // navigate
       case "/back":
@@ -1072,6 +1113,12 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
         return base.contains("\u2014") ? base + " (" + sel + ")" : base + " \u2014 " + sel;
       }
     }
+    if ("/frame".equals(path)) {
+      String sel = formatSelector(ctx.consumeLastSelector());
+      if (sel != null && !base.contains("\u2014")) {
+        return base + " \u2014 " + sel;
+      }
+    }
     return base;
   }
 
@@ -1096,7 +1143,9 @@ public class PlaywrightTraceRecorder implements NodeCommandInterceptor {
   /** Strips the verbose {@code "css selector: "} prefix; leaves other strategies intact. */
   private static String formatSelector(String raw) {
     if (raw == null) return null;
-    return raw.startsWith("css selector: ") ? raw.substring("css selector: ".length()) : raw;
+    String selector =
+        raw.startsWith("css selector: ") ? raw.substring("css selector: ".length()) : raw;
+    return selector.replace("\\-", "-");
   }
 
   // ---- Action label construction -------------------------------------------

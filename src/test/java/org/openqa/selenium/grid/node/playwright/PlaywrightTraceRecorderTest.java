@@ -202,6 +202,17 @@ class PlaywrightTraceRecorderTest {
         .isEqualTo("Verify elements absent \u2014 .toast");
   }
 
+  @Test
+  void verificationLabel_documentReadyStateCompleteIsPageReady() {
+    HttpRequest req =
+        post("/session/s1/execute/sync", "{\"script\":\"return document.readyState\",\"args\":[]}");
+
+    assertThat(
+            PlaywrightTraceRecorder.verificationLabel(
+                context(), req, response(200, "{\"value\":\"complete\"}"), null))
+        .isEqualTo("Page ready");
+  }
+
   // ---- isSeleniumAtomScript ------------------------------------------------
 
   @Test
@@ -244,6 +255,13 @@ class PlaywrightTraceRecorderTest {
   void isSeleniumAtomScript_scrollPositionProbe() {
     HttpRequest req =
         post("/session/s1/execute/sync", "{\"script\":\"return window.pageYOffset\",\"args\":[]}");
+    assertThat(PlaywrightTraceRecorder.isSeleniumAtomScript(req)).isTrue();
+  }
+
+  @Test
+  void isSeleniumAtomScript_documentReadyStateProbe() {
+    HttpRequest req =
+        post("/session/s1/execute/sync", "{\"script\":\"return document.readyState\",\"args\":[]}");
     assertThat(PlaywrightTraceRecorder.isSeleniumAtomScript(req)).isTrue();
   }
 
